@@ -4,9 +4,10 @@
 package commit
 
 import (
+	"fmt"
 	"math/rand"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -15,7 +16,7 @@ func TestQueue(t *testing.T) {
 	buf := NewBuffer(0)
 	buf.Reset("test")
 	for i := uint32(0); i < 10; i++ {
-		buf.PutUint64(i, 2*uint64(i))
+		buf.PutUint64(Put, i, 2*uint64(i))
 	}
 
 	i := 0
@@ -38,7 +39,7 @@ func TestRandom(t *testing.T) {
 
 	buf := NewBuffer(0)
 	for i := uint32(0); i < 1000; i++ {
-		buf.PutUint32(seq[i], uint32(rand.Int31()))
+		buf.PutUint32(Put, seq[i], uint32(rand.Int31()))
 	}
 
 	i := 0
@@ -60,7 +61,7 @@ func TestRange(t *testing.T) {
 
 	buf := NewBuffer(0)
 	for i := uint32(0); i < count; i++ {
-		buf.PutUint32(seq[i], uint32(rand.Int31()))
+		buf.PutUint32(Put, seq[i], uint32(rand.Int31()))
 	}
 
 	r := NewReader()
@@ -173,20 +174,16 @@ func TestReadSwap(t *testing.T) {
 	r.SwapUint(400)
 	assert.Equal(t, uint(400), r.Uint())
 	assert.True(t, r.Next())
-	r.SwapNumber(float64(800))
-	assert.Equal(t, float64(800), r.Float64())
 }
 
 func TestWriteUnsupported(t *testing.T) {
-	assert.Panics(t, func() {
-		buf := NewBuffer(0)
-		buf.PutAny(Put, 10, time.Time{})
-	})
+	buf := NewBuffer(0)
+	assert.Error(t, buf.PutAny(Put, 10, complex64(1)))
 }
 
 func TestReaderIface(t *testing.T) {
 	buf := NewBuffer(0)
-	buf.PutFloat64(777, float64(1))
+	buf.PutFloat64(Put, 777, float64(1))
 
 	r := NewReader()
 	r.Seek(buf)
@@ -197,9 +194,9 @@ func TestReaderIface(t *testing.T) {
 
 func TestReadIntMixedSize(t *testing.T) {
 	buf := NewBuffer(0)
-	buf.PutInt16(0, 10)
-	buf.PutInt32(1, 20)
-	buf.PutInt64(2, 30)
+	buf.PutInt16(Put, 0, 10)
+	buf.PutInt32(Put, 1, 20)
+	buf.PutInt64(Put, 2, 30)
 	buf.PutString(Put, 3, "hello")
 
 	r := NewReader()
@@ -218,8 +215,8 @@ func TestReadIntMixedSize(t *testing.T) {
 
 func TestReadFloatMixedSize(t *testing.T) {
 	buf := NewBuffer(0)
-	buf.PutFloat32(0, 10)
-	buf.PutFloat64(1, 20)
+	buf.PutFloat32(Put, 0, 10)
+	buf.PutFloat64(Put, 1, 20)
 	buf.PutString(Put, 3, "hello")
 
 	r := NewReader()
@@ -242,4 +239,104 @@ func TestReadSize(t *testing.T) {
 	r := NewReader()
 	r.readFixed(buf.buffer[0])
 	assert.Equal(t, 0, r.i1-r.i0)
+}
+
+func TestIndexAtChunk(t *testing.T) {
+	buf := NewBuffer(0)
+	buf.PutFloat32(Put, 10000, 10)
+	buf.PutFloat32(Put, 20000, 10)
+	buf.PutFloat32(Put, 30000, 10)
+
+	r := NewReader()
+	r.Seek(buf)
+	assert.True(t, r.Next())
+	assert.Equal(t, uint32(10000), r.IndexAtChunk())
+	assert.True(t, r.Next())
+	assert.Equal(t, uint32(3616), r.IndexAtChunk())
+}
+
+func TestSwapOpChange(t *testing.T) {
+	buf := NewBuffer(0)
+	buf.PutInt32(Merge, 10, int32(1))
+	assert.Equal(t, []byte{0x23, 0x0, 0x0, 0x0, 0x1, 0xa}, buf.buffer)
+
+	// Swap the value, this should also change the type
+	r := NewReader()
+	r.Seek(buf)
+	assert.True(t, r.Next())
+	assert.Equal(t, Merge, r.Type)
+	r.SwapInt32(int32(2))
+	assert.Equal(t, int32(2), r.Int32())
+
+	// Once swapped, op type should be changed to "Put"
+	r.Seek(buf)
+	assert.Equal(t, []byte{0x22, 0x0, 0x0, 0x0, 0x2, 0xa}, buf.buffer)
+	assert.True(t, r.Next())
+	assert.Equal(t, Put, r.Type)
+}
+
+func TestMergeBytes(t *testing.T) {
+	buf := NewBuffer(0)
+	buf.PutBytes(Merge, 10, []byte("A"))
+	assert.Equal(t, []byte{0x53, 0x0, 0x1, 0x41, 0xa}, buf.buffer)
+
+	// Swap the value, this should also change the type
+	r := NewReader()
+	r.Seek(buf)
+	assert.True(t, r.Next())
+	assert.Equal(t, Merge, r.Type)
+	r.SwapBytes([]byte("B"))
+
+	// Once swapped, op type should be changed to "Put"
+	r.Seek(buf)
+	assert.Equal(t, []byte{0x52, 0x0, 0x1, 0x42, 0xa}, buf.buffer)
+	assert.True(t, r.Next())
+	assert.Equal(t, Put, r.Type)
+}
+
+func TestMergeStrings(t *testing.T) {
+	buf := NewBuffer(0)
+	buf.PutBytes(Merge, 30, []byte("5"))
+	buf.PutBytes(Merge, 40, []byte("6"))
+	buf.PutBytes(Merge, 10, []byte("2"))
+	buf.PutBytes(Merge, 20, []byte("3"))
+
+	var scanned []string
+
+	// Swap the value, this should also change the type
+	r := NewReader()
+	r.Range(buf, 0, func(r *Reader) {
+		for r.Rewind(); r.Next(); {
+			i, _ := strconv.Atoi(r.String())
+			r.SwapString(strconv.Itoa(i * i))
+		}
+	})
+
+	r.Range(buf, 0, func(r *Reader) {
+		for r.Rewind(); r.Next(); {
+			scanned = append(scanned, fmt.Sprintf("(%s) %v", r.Type, r.String()))
+		}
+	})
+
+	assert.Equal(t, []string{
+		"(skip) 5",
+		"(skip) 6",
+		"(put) 4",
+		"(put) 9",
+		"(put) 25",
+		"(put) 36",
+	}, scanned)
+}
+
+func TestReaderIsUpsert(t *testing.T) {
+	buf := NewBuffer(0)
+	buf.PutFloat32(Put, 0, 10)
+	buf.PutFloat32(Delete, 0, 0)
+
+	r := NewReader()
+	r.Seek(buf)
+	assert.True(t, r.Next())
+	assert.True(t, r.IsUpsert())
+	assert.True(t, r.Next())
+	assert.True(t, r.IsDelete())
 }

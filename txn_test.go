@@ -5,23 +5,63 @@ package column
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 
+	"github.com/kelindar/column/commit"
+	"github.com/kelindar/xxrand"
 	"github.com/stretchr/testify/assert"
 )
+
+func FuzzInsert(f *testing.F) {
+	players := newEmpty(10)
+	defer players.Close()
+
+	f.Add("name", true, 30, 7.5)
+	f.Fuzz(func(t *testing.T, name string, active bool, age int, balance float64) {
+
+		idx, err := players.Insert(func(r Row) error {
+			r.SetString("name", name)
+			r.SetBool("active", active)
+			r.SetInt("age", age)
+			r.SetFloat64("balance", balance)
+			return nil
+		})
+
+		assert.NoError(t, err)
+		assert.NoError(t, players.QueryAt(idx, func(r Row) error {
+			assert.Equal(t, active, r.Bool("active"))
+
+			s, ok := r.String("name")
+			assert.True(t, ok)
+			assert.Equal(t, name, s)
+
+			i, ok := r.Int("age")
+			assert.True(t, ok)
+			assert.Equal(t, age, i)
+
+			f, ok := r.Float64("balance")
+			assert.True(t, ok)
+			assert.Equal(t, balance, f)
+			return nil
+		}))
+
+		assert.True(t, players.DeleteAt(idx))
+	})
+}
 
 func TestFind(t *testing.T) {
 	players := loadPlayers(500)
 	count := 0
 	players.Query(func(txn *Txn) error {
-		names := txn.Enum("name")
+		names := txn.String("name")
 
 		txn.WithString("race", func(v string) bool {
 			return v == "human"
 		}).WithString("class", func(v string) bool {
 			return v == "mage"
-		}).WithUint("age", func(v uint64) bool {
+		}).WithInt("age", func(v int64) bool {
 			return v >= 30
 		}).Range(func(index uint32) {
 			count++
@@ -146,7 +186,7 @@ func TestIndexInvalid(t *testing.T) {
 		players.Query(func(txn *Txn) error {
 			invalid := txn.Float64("invalid-column")
 			return txn.Range(func(index uint32) {
-				invalid.Add(1)
+				invalid.Merge(1)
 			})
 		})
 	})
@@ -205,7 +245,7 @@ func TestIndexed(t *testing.T) {
 
 	// Check the index value
 	players.Query(func(txn *Txn) error {
-		age := txn.Float64("age")
+		age := txn.Int("age")
 		old := txn.Bool("old")
 		class := txn.Enum("class")
 		txn.With("human", "mage", "old").
@@ -219,6 +259,184 @@ func TestIndexed(t *testing.T) {
 			})
 		return nil
 	})
+}
+
+func TestSortIndex(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("col1", ForString())
+	c.CreateSortIndex("sortedCol1", "col1")
+
+	assert.Error(t, c.CreateSortIndex("", ""))
+	assert.Error(t, c.CreateSortIndex("no_col", "nonexistent"))
+	assert.Error(t, c.CreateSortIndex("sortedCol1", "col1"))
+
+	indexCol, _ := c.cols.Load("sortedCol1")
+	assert.Equal(t, "col1", indexCol.Column.(*columnSortIndex).Column())
+	assert.False(t, indexCol.Column.(*columnSortIndex).Contains(0))
+	assert.Nil(t, indexCol.Column.(*columnSortIndex).Index(0))
+	v, ok := indexCol.Column.(*columnSortIndex).Value(0)
+	assert.Nil(t, v)
+	assert.False(t, ok)
+	assert.NotPanics(t, func() {
+		indexCol.Column.(*columnSortIndex).Grow(100)
+		indexCol.Column.(*columnSortIndex).Snapshot(0, nil)
+	})
+
+	// Inserts
+	c.Insert(func(r Row) error {
+		r.SetString("col1", "bob")
+		return nil
+	})
+	c.Insert(func(r Row) error {
+		r.SetString("col1", "carter")
+		return nil
+	})
+	c.Insert(func(r Row) error {
+		r.SetString("col1", "dan")
+		return nil
+	})
+	c.Insert(func(r Row) error {
+		r.SetString("col1", "alice")
+		return nil
+	})
+
+	// Update
+	assert.NoError(t, c.QueryAt(3, func(r Row) error {
+		assert.Equal(t, uint32(3), r.Index())
+		r.SetString("col1", "rob")
+		return nil
+	}))
+	assert.Equal(t, 4, indexCol.Column.(*columnSortIndex).btree.Len())
+
+	// Delete
+	assert.Equal(t, true, c.DeleteAt(1))
+	assert.Equal(t, 3, indexCol.Column.(*columnSortIndex).btree.Len())
+
+	// Range
+	assert.Error(t, c.Query(func(txn *Txn) error {
+		return txn.Ascend("nonexistent", func(i uint32) {
+			return
+		})
+	}))
+
+	var res [3]string
+	var resN int = 0
+	c.Query(func(txn *Txn) error {
+		col1 := txn.String("col1")
+		return txn.Ascend("sortedCol1", func(i uint32) {
+			name, _ := col1.Get()
+			res[resN] = name
+			resN++
+		})
+	})
+
+	assert.Equal(t, "bob", res[0])
+	assert.Equal(t, "dan", res[1])
+	assert.Equal(t, "rob", res[2])
+}
+
+func TestSortIndexLoad(t *testing.T) {
+
+	players := loadPlayers(500)
+	players.CreateSortIndex("sorted_names", "name")
+
+	checkN := 0
+	checks := map[int]string{
+		4:  "Buckner Frazier",
+		16: "Marla Todd",
+		30: "Shelly Kirk",
+		35: "out of range",
+	}
+
+	players.Query(func(txn *Txn) error {
+		txn = txn.With("human", "mage")
+		name := txn.String("name")
+		txn.Ascend("sorted_names", func(i uint32) {
+			n, _ := name.Get()
+			if res, exists := checks[checkN]; exists {
+				assert.Equal(t, res, n)
+			}
+			checkN++
+		})
+		return nil
+	})
+
+}
+
+func TestSortIndexChunks(t *testing.T) {
+	N := 100_000
+	obj := map[string]any{
+		"name":    "1",
+		"balance": 12.5,
+	}
+
+	players := NewCollection()
+	players.CreateColumnsOf(obj)
+	players.CreateSortIndex("sorted_names", "name")
+
+	for i := 0; i < N; i++ {
+		players.Insert(func(r Row) error {
+			return r.SetMany(map[string]any{
+				"name":    strconv.Itoa(i),
+				"balance": float64(i) + 0.5,
+			})
+		})
+	}
+
+	players.Query(func(txn *Txn) error {
+		name := txn.String("name")
+		txn.Ascend("sorted_names", func(i uint32) {
+			n, _ := name.Get()
+			if i%400 == 0 {
+				nInt, _ := strconv.Atoi(n)
+				assert.Equal(t, nInt, int(i))
+			}
+		})
+		return nil
+	})
+
+	// Concurrency Test
+	var wg sync.WaitGroup
+	order := new(sync.WaitGroup)
+	wg.Add(2)
+	order.Add(1)
+
+	// Do the same test as before at the same time as other updates
+	go func() {
+		players.Query(func(txn *Txn) error {
+			name := txn.String("name")
+			order.Done() // Ensure this txn begins before update
+			txn.Ascend("sorted_names", func(i uint32) {
+				n, _ := name.Get()
+				if i%400 == 0 {
+					nInt, _ := strconv.Atoi(n)
+					assert.Equal(t, nInt, int(i))
+				}
+			})
+			return nil
+		})
+		wg.Done()
+	}()
+
+	go func() {
+		order.Wait()                                // Wait for scan to begin
+		idx1 := xxrand.Uint32n(uint32(N/400)) * 400 // hit checked idxs only
+		idx2 := xxrand.Uint32n(uint32(N/400)) * 400
+		players.Insert(func(r Row) error {
+			r.SetString("name", "new")
+			r.SetFloat64("balance", 43.2)
+			return nil
+		})
+		players.QueryAt(idx1, func(r Row) error {
+			r.SetString("name", "updated")
+			return nil
+		})
+		players.DeleteAt(idx2)
+		wg.Done()
+	}()
+
+	wg.Wait()
+	assert.Equal(t, 100_000, players.Count())
 }
 
 func TestDeleteAll(t *testing.T) {
@@ -296,8 +514,8 @@ func TestIndexWithAtomicAdd(t *testing.T) {
 		balance := txn.Float64("balance")
 		for i := 0; i < 30; i++ {
 			txn.Range(func(index uint32) {
-				balance.Add(50.0)
-				balance.Add(50.0)
+				balance.Merge(50.0)
+				balance.Merge(50.0)
 			})
 		}
 		return nil
@@ -363,10 +581,11 @@ func TestCountTwice(t *testing.T) {
 
 	model.Query(func(txn *Txn) error {
 		for i := 0; i < 20000; i++ {
-			_, err := txn.InsertObject(map[string]interface{}{
-				"string": fmt.Sprint(i),
+			_, err := txn.Insert(func(r Row) error {
+				return r.SetMany(map[string]any{
+					"string": fmt.Sprint(i),
+				})
 			})
-
 			assert.NoError(t, err)
 		}
 		return nil
@@ -397,8 +616,10 @@ func TestUninitializedSet(t *testing.T) {
 
 	assert.NoError(t, c.Query(func(txn *Txn) error {
 		for i := 0; i < 20000; i++ {
-			txn.InsertObject(map[string]interface{}{
-				"col1": fmt.Sprint(i % 3),
+			txn.Insert(func(r Row) error {
+				return r.SetMany(map[string]any{
+					"col1": fmt.Sprint(i % 3),
+				})
 			})
 		}
 		return nil
@@ -425,10 +646,13 @@ func TestUninitializedSet(t *testing.T) {
 func TestUpdateAt(t *testing.T) {
 	c := NewCollection()
 	c.CreateColumn("col1", ForString())
-	index := c.InsertObject(map[string]interface{}{
-		"col1": "hello",
+	index, err := c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{
+			"col1": "hello",
+		})
 	})
 
+	assert.NoError(t, err)
 	assert.NoError(t, c.QueryAt(index, func(r Row) error {
 		r.SetString("col1", "hi")
 		return nil
@@ -456,7 +680,7 @@ func TestUpdateAtNoChanges(t *testing.T) {
 	}))
 
 	assert.NoError(t, c.QueryAt(0, func(r Row) error {
-		r.txn.bufferFor("xxx").PutInt(123, 123)
+		r.txn.bufferFor("xxx").PutInt(commit.Put, 123, 123)
 		return nil
 	}))
 }
@@ -465,13 +689,13 @@ func TestUpsertKey(t *testing.T) {
 	c := NewCollection()
 	c.CreateColumn("key", ForKey())
 	c.CreateColumn("val", ForString())
-	assert.NoError(t, c.QueryKey("1", func(r Row) error {
+	assert.NoError(t, c.UpsertKey("1", func(r Row) error {
 		r.SetString("val", "Roman")
 		return nil
 	}))
 
 	count := 0
-	assert.NoError(t, c.QueryKey("1", func(r Row) error {
+	assert.NoError(t, c.UpsertKey("1", func(r Row) error {
 		count++
 		return nil
 	}))
@@ -484,14 +708,111 @@ func TestUpsertKeyNoColumn(t *testing.T) {
 	c.CreateColumn("key", ForKey())
 
 	assert.Panics(t, func() {
-		c.QueryKey("1", func(r Row) error {
+		c.UpsertKey("1", func(r Row) error {
 			r.Enum("xxx")
 			return nil
 		})
 	})
 }
 
-func TestDuplicateKey(t *testing.T) {
+func TestDeleteKey(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("key", ForKey())
+	c.CreateColumn("val", ForString())
+	assert.NoError(t, c.InsertKey("1", func(r Row) error {
+		r.SetString("val", "Roman")
+		return nil
+	}))
+
+	// Only one should succeed
+	assert.NoError(t, c.DeleteKey("1"))
+	assert.Error(t, c.DeleteKey("1"))
+	assert.Equal(t, 0, c.Count())
+}
+
+func TestInsertKey(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("key", ForKey())
+
+	// Only one should succeed
+	assert.NoError(t, c.InsertKey("1", func(r Row) error {
+		return nil
+	}))
+	assert.Error(t, c.InsertKey("1", func(r Row) error {
+		return nil
+	}))
+	assert.Equal(t, 1, c.Count())
+}
+
+func TestQueryKey(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("key", ForKey())
+	c.CreateColumn("val", ForString())
+
+	assert.Error(t, c.QueryKey("1", func(r Row) error {
+		return nil
+	}))
+
+	assert.NoError(t, c.InsertKey("1", func(r Row) error {
+		r.SetString("val", "Roman")
+		return nil
+	}))
+
+	assert.NoError(t, c.QueryKey("1", func(r Row) error {
+		return nil
+	}))
+}
+
+func TestChangeKey(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("key", ForKey())
+
+	// Try to change the key from "1" to "2"
+	assert.NoError(t, c.InsertKey("1", func(r Row) error { return nil }))
+	assert.NoError(t, c.QueryKey("1", func(r Row) error {
+		r.SetKey("2")
+		return nil
+	}))
+
+	// Must now have "2"
+	assert.NoError(t, c.QueryKey("2", func(r Row) error { return nil }))
+	assert.Equal(t, 1, c.Count())
+}
+
+func TestRollbackInsert(t *testing.T) {
+	col := NewCollection()
+	assert.NoError(t, col.CreateColumn("name", ForString()))
+
+	// Insert successfully
+	idx0, err := col.Insert(func(r Row) error {
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, uint32(0), idx0)
+
+	// Insert with error
+	idx1, err := col.Insert(func(r Row) error {
+		return fmt.Errorf("error")
+	})
+	assert.Error(t, err)
+	assert.Equal(t, uint32(1), idx1)
+
+	// Should only have 1 element
+	assert.Equal(t, 1, col.Count())
+}
+
+func TestUnkeyedInsert(t *testing.T) {
+	col := NewCollection()
+	assert.NoError(t, col.CreateColumn("key", ForKey()))
+
+	// Insert should fail, as one should use InsertKey() method
+	_, err := col.Insert(func(r Row) error {
+		return nil
+	})
+	assert.Error(t, err)
+}
+
+func TestDuplicateKeyColumn(t *testing.T) {
 	c := NewCollection()
 	assert.NoError(t, c.CreateColumn("key1", ForKey()))
 	assert.Error(t, c.CreateColumn("key2", ForKey()))
@@ -513,8 +834,7 @@ func TestRowMethods(t *testing.T) {
 	c.CreateColumn("float32", ForFloat32())
 	c.CreateColumn("float64", ForFloat64())
 
-	c.Insert(func(r Row) error {
-		r.SetKey("key")
+	c.InsertKey("key", func(r Row) error {
 		r.SetBool("bool", true)
 		r.SetAny("name", "Roman")
 
@@ -531,16 +851,16 @@ func TestRowMethods(t *testing.T) {
 		r.SetFloat64("float64", 1)
 
 		// Increment
-		r.AddInt("int", 1)
-		r.AddInt16("int16", 1)
-		r.AddInt32("int32", 1)
-		r.AddInt64("int64", 1)
-		r.AddUint("uint", 1)
-		r.AddUint16("uint16", 1)
-		r.AddUint32("uint32", 1)
-		r.AddUint64("uint64", 1)
-		r.AddFloat32("float32", 1)
-		r.AddFloat64("float64", 1)
+		r.MergeInt("int", 1)
+		r.MergeInt16("int16", 1)
+		r.MergeInt32("int32", 1)
+		r.MergeInt64("int64", 1)
+		r.MergeUint("uint", 1)
+		r.MergeUint16("uint16", 1)
+		r.MergeUint32("uint32", 1)
+		r.MergeUint64("uint64", 1)
+		r.MergeFloat32("float32", 1)
+		r.MergeFloat64("float64", 1)
 		return nil
 	})
 
@@ -575,9 +895,7 @@ func TestRow(t *testing.T) {
 	wg.Add(2)
 
 	go c.Query(func(txn *Txn) error {
-		txn.Insert(func(r Row) error {
-			name := txn.Key()
-			name.Set("Roman")
+		txn.InsertKey("Roman", func(r Row) error {
 			return nil
 		})
 		wg.Done()
@@ -591,4 +909,247 @@ func TestRow(t *testing.T) {
 	})
 
 	wg.Wait()
+}
+
+func TestUnion(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("d_a", ForString())
+
+	c.CreateIndex("d_a_1", "d_a", func(r Reader) bool { return r.String() == "1" })
+	c.CreateIndex("d_a_2", "d_a", func(r Reader) bool { return r.String() == "2" })
+	c.CreateIndex("d_a_3", "d_a", func(r Reader) bool { return r.String() == "on99" })
+
+	c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{"d_a": "1"})
+	})
+
+	c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{"d_a": "2"})
+	})
+
+	c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{"d_a": "on99"})
+	})
+
+	c.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.Union("d_a_1").Count())
+		return nil
+	})
+
+	c.Query(func(txn *Txn) error {
+		assert.Equal(t, 2, txn.Union("d_a_1").Union("d_a_2").Count())
+		return nil
+	})
+
+	c.Query(func(txn *Txn) error {
+		assert.Equal(t, 2, txn.Union("d_a_2", "d_a_3").Count())
+		return nil
+	})
+
+	c.Query(func(txn *Txn) error {
+		assert.Equal(t, 3, txn.Union("d_a_1", "d_a_2").Union("d_a_3").Count())
+		return nil
+	})
+}
+
+func TestWithUnion(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("tester", ForString())
+	c.CreateColumn("testerB", ForString())
+
+	c.CreateIndex("tester_1", "tester", func(r Reader) bool { return r.String() == "1" })
+	c.CreateIndex("tester_2", "tester", func(r Reader) bool { return r.String() == "2" })
+	c.CreateIndex("tester_3", "tester", func(r Reader) bool { return r.String() == "3" })
+	c.CreateIndex("testerB_4", "testerB", func(r Reader) bool { return r.String() == "4" })
+	c.CreateIndex("testerB_5", "testerB", func(r Reader) bool { return r.String() == "5" })
+	c.CreateIndex("testerB_6", "testerB", func(r Reader) bool { return r.String() == "6" })
+
+	c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{
+			"tester":  "1",
+			"testerB": "4",
+		})
+	})
+
+	c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{
+			"tester":  "2",
+			"testerB": "5",
+		})
+	})
+
+	c.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{
+			"tester":  "3",
+			"testerB": "6",
+		})
+	})
+
+	// account for normal use-case
+	c.Query(func(txn *Txn) error {
+		txn.WithUnion("tester_1", "tester_2")
+		txn.Union("testerB_5", "testerB_6")
+
+		assert.Equal(t, 3, txn.Count())
+		return nil
+	})
+
+	// where tester in ['1', '2'] and testerB in ['5', '6']
+	c.Query(func(txn *Txn) error {
+		txn.Union("tester_1", "tester_2")
+		txn.WithUnion("testerB_5", "testerB_6")
+
+		assert.Equal(t, 1, txn.Count())
+		return nil
+	})
+
+	c.Query(func(txn *Txn) error {
+		txn.Without("tester_1", "testerB_5")
+		txn.WithUnion("tester_2", "tester_1", "tester_3")
+
+		assert.Equal(t, 1, txn.Count())
+		return nil
+	})
+}
+
+func TestWithUnionPlayers(t *testing.T) {
+	trueCount := 0
+	players := loadPlayers(100000)
+
+	players.Query(func(txn *Txn) error {
+		ageCol := txn.Any("age")
+		raceCol := txn.Any("race")
+		classCol := txn.Any("class")
+
+		return txn.Range(func(i uint32) {
+			age, _ := ageCol.Get()
+			race, _ := raceCol.Get()
+			class, _ := classCol.Get()
+
+			if race == "dwarf" && (age.(int) >= 30.0 || class == "mage") {
+				trueCount++
+			}
+		})
+	})
+
+	players.Query(func(txn *Txn) error {
+		txn.With("dwarf")
+		txn.WithUnion("mage", "old")
+
+		assert.Equal(t, trueCount, txn.Count())
+		return nil
+	})
+
+	players.Query(func(txn *Txn) error {
+		txn.With("dwarf", "mage", "old")
+		assert.True(t, txn.Count() < trueCount)
+		return nil
+	})
+
+	players.Query(func(txn *Txn) error {
+		txn.Union("dwarf", "mage", "old")
+		assert.True(t, txn.Count() > trueCount)
+		return nil
+	})
+
+	// dwarf & elf cancel out
+	players.Query(func(txn *Txn) error {
+		txn.With("dwarf")
+		txn.WithUnion("mage", "old", "elf")
+		assert.Equal(t, trueCount, txn.Count())
+		return nil
+	})
+}
+
+func TestSumBalance(t *testing.T) {
+	players := loadPlayers(500)
+	assert.Equal(t, 500, players.Count())
+
+	players.Query(func(txn *Txn) error {
+		sum := int(txn.Float64("balance").Sum())
+		assert.Equal(t, 1212084, sum)
+		return nil
+	})
+
+	players.Query(func(txn *Txn) error {
+		sum := int(txn.With("old", "mage").Float64("balance").Sum())
+		assert.Equal(t, 186440, sum)
+		return nil
+	})
+}
+
+func TestAvgBalance(t *testing.T) {
+	players := loadPlayers(500)
+	assert.Equal(t, 500, players.Count())
+
+	players.Query(func(txn *Txn) error {
+		sum := int(txn.Float64("balance").Avg())
+		assert.Equal(t, 2424, sum)
+		return nil
+	})
+
+	players.Query(func(txn *Txn) error {
+		sum := int(txn.With("old", "mage").Float64("balance").Avg())
+		assert.Equal(t, 2421, sum)
+		return nil
+	})
+}
+
+func TestMinBalance(t *testing.T) {
+	players := loadPlayers(500)
+	assert.Equal(t, 500, players.Count())
+
+	players.Query(func(txn *Txn) error {
+		min, ok := txn.Float64("balance").Min()
+		assert.Equal(t, float64(1010.06), min)
+		assert.True(t, ok)
+		return nil
+	})
+
+	players.Query(func(txn *Txn) error {
+		min, ok := txn.With("old", "mage", "human").Float64("balance").Min()
+		assert.Equal(t, float64(1023.76), min)
+		assert.True(t, ok)
+		return nil
+	})
+}
+
+func TestMaxBalance(t *testing.T) {
+	players := loadPlayers(500)
+	assert.Equal(t, 500, players.Count())
+
+	players.Query(func(txn *Txn) error {
+		max, ok := txn.Float64("balance").Max()
+		assert.Equal(t, float64(3982.14), max)
+		assert.True(t, ok)
+		return nil
+	})
+
+	players.Query(func(txn *Txn) error {
+		max, ok := txn.With("old", "mage", "human").Float64("balance").Max()
+		assert.Equal(t, float64(3978.83), max)
+		assert.True(t, ok)
+		return nil
+	})
+}
+
+func TestSetManyErr(t *testing.T) {
+	players := loadPlayers(500)
+	t.Run("invalid", func(t *testing.T) {
+		_, err := players.Insert(func(r Row) error {
+			return r.SetMany(map[string]any{
+				"invalid": 1,
+			})
+		})
+		assert.Error(t, err)
+	})
+
+	t.Run("write", func(t *testing.T) {
+		_, err := players.Insert(func(r Row) error {
+			return r.SetMany(map[string]any{
+				"age": complex64(1),
+			})
+		})
+		assert.Error(t, err)
+	})
 }

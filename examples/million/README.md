@@ -1,44 +1,37 @@
-# One Million Rows
+# Ten Million Rows
 
-This example adds one million rows to a collection, runs and measures a few different queries and transaction around it.
+This example adds 10 million rows to a collection, runs and measures a few different queries and transaction around it.
 
 ## Example output
 
 ```
-running insert of 1000000 rows...
--> inserted 0 rows
--> inserted 100000 rows
--> inserted 200000 rows
--> inserted 300000 rows
--> inserted 400000 rows
--> inserted 500000 rows
--> inserted 600000 rows
--> inserted 700000 rows
--> inserted 800000 rows
--> inserted 900000 rows
--> insert took 1.0899436s
+running insert of 10000000 rows...
+-> insert took 7.6464726s
+
+running snapshot of 10000000 rows...
+-> snapshot took 1.35868707s
 
 running full scan of age >= 30...
--> result = 510000
--> full scan took 2.834398ms
+-> result = 5100000
+-> full scan took 27.011615ms
 
 running full scan of class == "rogue"...
--> result = 358000
--> full scan took 4.381428ms
+-> result = 3580000
+-> full scan took 45.053185ms
 
 running indexed query of human mages...
--> result = 68000
--> indexed query took 17.813µs
+-> result = 680000
+-> indexed query took 309.74µs
 
 running indexed query of human female mages...
--> result = 32000
--> indexed query took 22.354µs
+-> result = 320000
+-> indexed query took 385.606µs
 
 running update of balance of everyone...
--> updated 1000000 rows
--> update took 11.882838ms
+-> updated 10000000 rows
+-> update took 108.09756ms
 
 running update of age of mages...
--> updated 302000 rows
--> update took 4.353562ms
+-> updated 3020000 rows
+-> update took 41.731165ms
 ```

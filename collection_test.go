@@ -5,55 +5,38 @@ package column
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kelindar/column/commit"
+	"github.com/kelindar/column/fixtures"
+	"github.com/kelindar/xxrand"
 	"github.com/stretchr/testify/assert"
 )
 
 /*
 cpu: Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz
-BenchmarkCollection/insert-8         	    2523	    469481 ns/op	   24356 B/op	     500 allocs/op
-BenchmarkCollection/select-at-8      	22194190	        54.23 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/scan-8           	    2068	    568953 ns/op	     122 B/op	       0 allocs/op
-BenchmarkCollection/count-8          	  571449	      2057 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/range-8          	   28660	     41695 ns/op	       3 B/op	       0 allocs/op
-BenchmarkCollection/update-at-8      	 5911978	       202.8 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/update-all-8     	    1280	    946272 ns/op	    3726 B/op	       0 allocs/op
-BenchmarkCollection/delete-at-8      	 6405852	       188.9 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/delete-all-8     	 2073188	       562.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/select-at-8      	18796579	        56.27 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/scan-8           	    2220	    614501 ns/op	     114 B/op	       0 allocs/op
+BenchmarkCollection/count-8          	  499893	      2414 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/range-8          	   25044	     47727 ns/op	       5 B/op	       0 allocs/op
+BenchmarkCollection/sum-8            	   84232	     14045 ns/op	       2 B/op	       0 allocs/op
+BenchmarkCollection/avg-8            	   41404	     30238 ns/op	       3 B/op	       0 allocs/op
+BenchmarkCollection/max-8            	   41194	     28929 ns/op	       6 B/op	       0 allocs/op
+BenchmarkCollection/update-at-8      	 5999748	       199.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/update-all-8     	    1269	    947274 ns/op	    4179 B/op	       0 allocs/op
+BenchmarkCollection/delete-at-8      	 7177303	       184.5 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/delete-all-8     	 2063108	       614.8 ns/op	       0 B/op	       0 allocs/op
 */
 func BenchmarkCollection(b *testing.B) {
 	amount := 100000
 	players := loadPlayers(amount)
-
-	b.Run("insert", func(b *testing.B) {
-		temp := loadPlayers(500)
-		data := loadFixture("players.json")
-		b.ReportAllocs()
-		b.ResetTimer()
-		for n := 0; n < b.N; n++ {
-			b.StopTimer()
-			temp.Query(func(txn *Txn) error {
-				txn.DeleteAll()
-				return nil
-			})
-			b.StartTimer()
-
-			temp.Query(func(txn *Txn) error {
-				for _, p := range data {
-					txn.InsertObject(p)
-				}
-				return nil
-			})
-		}
-	})
 
 	b.Run("select-at", func(b *testing.B) {
 		name := ""
@@ -61,7 +44,7 @@ func BenchmarkCollection(b *testing.B) {
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
 			players.QueryAt(20, func(r Row) error {
-				name, _ = r.Enum("name")
+				name, _ = r.String("name")
 				return nil
 			})
 		}
@@ -102,7 +85,7 @@ func BenchmarkCollection(b *testing.B) {
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
 			players.Query(func(txn *Txn) error {
-				names := txn.Enum("name")
+				names := txn.String("name")
 				txn.With("human", "mage", "old").Range(func(idx uint32) {
 					count++
 					name, _ = names.Get()
@@ -111,6 +94,45 @@ func BenchmarkCollection(b *testing.B) {
 			})
 		}
 		assert.NotEmpty(b, name)
+	})
+
+	b.Run("sum", func(b *testing.B) {
+		v := 0.0
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			players.Query(func(txn *Txn) error {
+				v = txn.Float64("balance").Sum()
+				return nil
+			})
+		}
+		assert.NotEqual(b, float64(0), v)
+	})
+
+	b.Run("avg", func(b *testing.B) {
+		v := 0.0
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			players.Query(func(txn *Txn) error {
+				v = txn.With("human", "mage", "old").Float64("balance").Avg()
+				return nil
+			})
+		}
+		assert.NotEqual(b, float64(0), v)
+	})
+
+	b.Run("max", func(b *testing.B) {
+		v := 0.0
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			players.Query(func(txn *Txn) error {
+				v, _ = txn.With("human", "mage", "old").Float64("balance").Max()
+				return nil
+			})
+		}
+		assert.NotEqual(b, float64(0), v)
 	})
 
 	b.Run("update-at", func(b *testing.B) {
@@ -158,8 +180,78 @@ func BenchmarkCollection(b *testing.B) {
 	})
 }
 
+/*
+cpu: Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz
+BenchmarkRecord/get-8         	 6342373	       172.3 ns/op	      24 B/op	       1 allocs/op
+BenchmarkRecord/set-8         	 4228219	       275.3 ns/op	      32 B/op	       2 allocs/op
+BenchmarkRecord/merge-8       	 2673375	       443.7 ns/op	      32 B/op	       2 allocs/op
+*/
+func BenchmarkRecord(b *testing.B) {
+	const amount = 100000
+
+	// Create a test collection for records
+	newCollection := func() *Collection {
+		col := NewCollection()
+		col.CreateColumn("ts", ForRecord(func() *time.Time {
+			return new(time.Time)
+		}))
+
+		for i := 0; i < amount; i++ {
+			col.Insert(func(r Row) error {
+				now := time.Unix(1667745766, 0)
+				r.SetRecord("ts", &now)
+				return nil
+			})
+		}
+		return col
+	}
+
+	// Decodes records at random indices
+	b.Run("get", func(b *testing.B) {
+		col := newCollection()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			col.QueryAt(xxrand.Uint32n(amount), func(r Row) error {
+				r.Record("ts")
+				return nil
+			})
+		}
+	})
+
+	// Merges records at random indices
+	b.Run("set", func(b *testing.B) {
+		col := newCollection()
+		now := time.Unix(1667745766, 0)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			col.QueryAt(xxrand.Uint32n(amount), func(r Row) error {
+				r.SetRecord("ts", &now)
+				return nil
+			})
+		}
+	})
+
+	// Merges records at random indices
+	b.Run("merge", func(b *testing.B) {
+		col := newCollection()
+		now := time.Unix(1667745766, 0)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			col.QueryAt(xxrand.Uint32n(amount), func(r Row) error {
+				r.MergeRecord("ts", &now)
+				return nil
+			})
+		}
+	})
+}
+
 func TestCollection(t *testing.T) {
-	obj := Object{
+	obj := map[string]any{
 		"name":   "Roman",
 		"age":    35,
 		"wallet": 50.99,
@@ -169,9 +261,20 @@ func TestCollection(t *testing.T) {
 
 	col := NewCollection()
 	col.CreateColumnsOf(obj)
-	idx := col.InsertObject(obj)
+
+	// Insert first row
+	idx, err := col.Insert(func(r Row) error {
+		return r.SetMany(obj)
+	})
+	assert.NoError(t, err)
 	assert.Equal(t, uint32(0), idx)
-	assert.Equal(t, uint32(1), col.InsertObject(obj))
+
+	// Insert second row
+	idx, err = col.Insert(func(r Row) error {
+		return r.SetMany(obj)
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, uint32(1), idx)
 
 	// Should not drop, since it's not an index
 	assert.Error(t, col.DropIndex("name"))
@@ -203,7 +306,11 @@ func TestCollection(t *testing.T) {
 	}
 
 	{ // Add a new one, should replace
-		newIdx := col.InsertObject(obj)
+		newIdx, err := col.Insert(func(r Row) error {
+			return r.SetMany(obj)
+		})
+
+		assert.NoError(t, err)
 		assert.Equal(t, idx, newIdx)
 		assert.NoError(t, col.QueryAt(newIdx, func(r Row) error {
 			name, ok := r.String("name")
@@ -241,7 +348,7 @@ func TestCollection(t *testing.T) {
 }
 
 func TestDropColumn(t *testing.T) {
-	obj := Object{
+	obj := map[string]any{
 		"wallet": 5000,
 	}
 
@@ -251,8 +358,13 @@ func TestDropColumn(t *testing.T) {
 		return r.Float() > 100
 	}))
 
-	assert.Equal(t, uint32(0), col.InsertObject(obj))
-	assert.Equal(t, uint32(1), col.InsertObject(obj))
+	for i := 0; i < 2; i++ {
+		idx, err := col.Insert(func(r Row) error {
+			return r.SetMany(obj)
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(i), idx)
+	}
 
 	col.DropColumn("rich")
 	col.Query(func(txn *Txn) error {
@@ -261,11 +373,15 @@ func TestDropColumn(t *testing.T) {
 	})
 }
 
-func TestInsertObject(t *testing.T) {
+func TestInsertMany(t *testing.T) {
 	col := NewCollection()
 	col.CreateColumn("name", ForString())
-	col.InsertObject(Object{"name": "A"})
-	col.InsertObject(Object{"name": "B"})
+	col.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{"name": "A"})
+	})
+	col.Insert(func(r Row) error {
+		return r.SetMany(map[string]any{"name": "B"})
+	})
 
 	assert.Equal(t, 2, col.Count())
 	assert.NoError(t, col.QueryAt(0, func(r Row) error {
@@ -279,7 +395,7 @@ func TestInsertObject(t *testing.T) {
 func TestExpire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	obj := Object{
+	obj := map[string]any{
 		"name":   "Roman",
 		"age":    35,
 		"wallet": 50.99,
@@ -292,13 +408,17 @@ func TestExpire(t *testing.T) {
 	defer col.Close()
 
 	// Insert an object
-	col.InsertObjectWithTTL(obj, time.Microsecond)
+	col.Insert(func(r Row) error {
+		r.SetTTL(time.Microsecond)
+		return r.SetMany(obj)
+	})
+
 	col.Query(func(txn *Txn) error {
-		expire := txn.Int64(expireColumn)
+		ttl := txn.TTL()
 		return txn.Range(func(idx uint32) {
-			value, _ := expire.Get()
-			expireAt := time.Unix(0, value)
-			expire.Set(expireAt.Add(1 * time.Microsecond).UnixNano())
+			remaining, ok := ttl.TTL()
+			assert.True(t, ok)
+			assert.NotZero(t, remaining)
 		})
 	})
 	assert.Equal(t, 1, col.Count())
@@ -311,22 +431,65 @@ func TestExpire(t *testing.T) {
 	assert.Equal(t, 0, col.Count())
 }
 
+func TestExpireExtend(t *testing.T) {
+	col := loadPlayers(500)
+	assert.NoError(t, col.Query(func(txn *Txn) error {
+		ttl := txn.TTL()
+		return txn.Range(func(idx uint32) {
+
+			// When loaded, we should n ot have any expiration set
+			_, hasExpiration := ttl.ExpiresAt()
+			assert.False(t, hasExpiration)
+			_, hasRemaining := ttl.TTL()
+			assert.False(t, hasRemaining)
+
+			// Extend by 2 hours
+			ttl.Set(time.Hour)
+			ttl.Extend(time.Hour)
+		})
+	}))
+
+	// Now we should have expiration time set
+	assert.NoError(t, col.Query(func(txn *Txn) error {
+		ttl := txn.TTL()
+		return txn.Range(func(idx uint32) {
+			_, hasExpiration := ttl.ExpiresAt()
+			assert.True(t, hasExpiration)
+			_, hasRemaining := ttl.TTL()
+			assert.True(t, hasRemaining)
+		})
+	}))
+
+	// Reset back to zero
+	assert.NoError(t, col.Query(func(txn *Txn) error {
+		ttl := txn.TTL()
+		return txn.Range(func(idx uint32) {
+			ttl.Set(0) // Reset to zero
+		})
+	}))
+}
+
 func TestCreateIndex(t *testing.T) {
-	row := Object{
+	row := map[string]any{
 		"age": 35,
 	}
 
 	// Create a collection with 1 row
 	col := NewCollection()
-	col.CreateColumnsOf(row)
-	col.InsertObject(row)
 	defer col.Close()
+
+	col.CreateColumnsOf(row)
+	col.Insert(func(r Row) error {
+		return r.SetMany(row)
+	})
 
 	// Create an index, add 1 more row
 	assert.NoError(t, col.CreateIndex("young", "age", func(r Reader) bool {
 		return r.Int() < 50
 	}))
-	col.InsertObject(row)
+	col.Insert(func(r Row) error {
+		return r.SetMany(row)
+	})
 
 	// We now should have 2 rows in the index
 	col.Query(func(txn *Txn) error {
@@ -345,15 +508,18 @@ func TestCreateIndexInvalidColumn(t *testing.T) {
 }
 
 func TestDropIndex(t *testing.T) {
-	row := Object{
+	row := map[string]any{
 		"age": 35,
 	}
 
 	// Create a collection with 1 row
 	col := NewCollection()
-	col.CreateColumnsOf(row)
-	col.InsertObject(row)
 	defer col.Close()
+
+	col.CreateColumnsOf(row)
+	col.Insert(func(r Row) error {
+		return r.SetMany(row)
+	})
 
 	// Create an index
 	assert.NoError(t, col.CreateIndex("young", "age", func(r Reader) bool {
@@ -395,7 +561,7 @@ func TestDropOneOfMultipleIndices(t *testing.T) {
 }
 
 func TestInsertParallel(t *testing.T) {
-	obj := Object{
+	obj := map[string]any{
 		"name":   "Roman",
 		"age":    35,
 		"wallet": 50.99,
@@ -404,11 +570,16 @@ func TestInsertParallel(t *testing.T) {
 	}
 
 	col := NewCollection()
+	col.CreateColumnsOf(obj)
+
 	var wg sync.WaitGroup
 	wg.Add(500)
 	for i := 0; i < 500; i++ {
 		go func() {
-			col.InsertObject(obj)
+			_, err := col.Insert(func(r Row) error {
+				return r.SetMany(obj)
+			})
+			assert.NoError(t, err)
 			wg.Done()
 		}()
 	}
@@ -421,8 +592,96 @@ func TestInsertParallel(t *testing.T) {
 	}))
 }
 
+func BenchmarkParallelSort(b *testing.B) {
+	getobj := func(n string) map[string]any {
+		return map[string]any{
+			"name":   n,
+			"age":    35,
+			"wallet": 50.99,
+			"health": 100,
+			"mana":   200,
+		}
+	}
+
+	b.Run("in-asc", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for n := 0; n < b.N; n++ {
+			col := NewCollection()
+			col.CreateColumnsOf(getobj("n"))
+			col.CreateSortIndex("sorted_name", "name")
+			var wg sync.WaitGroup
+			wg.Add(20)
+			for i := 0; i < 20; i++ {
+				go func(ii int) {
+					for x := 0; x < 5000; x++ {
+						tobj := getobj("n")
+						tobj["name"] = strconv.Itoa((ii * 20) + x)
+						col.Insert(func(r Row) error {
+							return r.SetMany(tobj)
+						})
+					}
+					wg.Done()
+				}(i)
+				go func(ii int) {
+					for y := 0; y < 5; y++ {
+						col.Query(func(txn *Txn) error {
+							health := txn.Int("health")
+							return txn.Ascend("sorted_name", func(i uint32) {
+								health.Set((ii * 20) + y)
+							})
+						})
+					}
+				}(i)
+			}
+			wg.Wait()
+		}
+	})
+}
+
+func TestParallelSort(t *testing.T) {
+	getobj := func(n string) map[string]any {
+		return map[string]any{
+			"name":   n,
+			"age":    35,
+			"wallet": 50.99,
+			"health": 100,
+			"mana":   200,
+		}
+	}
+
+	col := NewCollection()
+	col.CreateColumnsOf(getobj("n"))
+	col.CreateSortIndex("sorted_name", "name")
+
+	var wg sync.WaitGroup
+	wg.Add(20)
+	for i := 0; i < 20; i++ {
+		go func(ii int) {
+			for x := 0; x < 5000; x++ {
+				tobj := getobj("n")
+				tobj["name"] = strconv.Itoa((ii * 20) + x)
+				col.Insert(func(r Row) error {
+					return r.SetMany(tobj)
+				})
+			}
+			wg.Done()
+		}(i)
+		go func(ii int) {
+			col.Query(func(txn *Txn) error {
+				health := txn.Int("health")
+				return txn.Ascend("sorted_name", func(i uint32) {
+					health.Set(ii)
+				})
+			})
+		}(i)
+	}
+	wg.Wait()
+	assert.Equal(t, 100_000, col.Count())
+}
+
 func TestConcurrentPointReads(t *testing.T) {
-	obj := Object{
+	obj := map[string]any{
 		"name":   "Roman",
 		"age":    35,
 		"wallet": 50.99,
@@ -433,7 +692,9 @@ func TestConcurrentPointReads(t *testing.T) {
 	col := NewCollection()
 	col.CreateColumnsOf(obj)
 	for i := 0; i < 1000; i++ {
-		col.InsertObject(obj)
+		col.Insert(func(r Row) error {
+			return r.SetMany(obj)
+		})
 	}
 
 	var ops int64
@@ -486,16 +747,21 @@ func TestInsertWithTTL(t *testing.T) {
 	c := NewCollection()
 	c.CreateColumn("name", ForString())
 
-	idx, err := c.InsertWithTTL(time.Hour, func(r Row) error {
-		r.SetString("name", "Roman")
+	idx, err := c.Insert(func(r Row) error {
+		if _, ok := r.TTL(); !ok {
+			assert.True(t, r.SetTTL(0).IsZero())
+			assert.False(t, r.SetTTL(time.Hour).IsZero())
+			r.SetString("name", "Roman")
+		}
 		return nil
 	})
+
 	assert.Equal(t, uint32(0), idx)
 	assert.NoError(t, err)
 	assert.NoError(t, c.QueryAt(idx, func(r Row) error {
-		expire, ok := r.Int64(expireColumn)
+		ttl, ok := r.TTL()
 		assert.True(t, ok)
-		assert.NotZero(t, expire)
+		assert.NotZero(t, ttl)
 		return nil
 	}))
 }
@@ -532,6 +798,96 @@ func TestFindFreeIndex(t *testing.T) {
 	}
 }
 
+func TestReplica(t *testing.T) {
+	w := make(commit.Channel, 1024)
+	source := NewCollection(Options{
+		Writer: w,
+	})
+	source.CreateColumn("id", ForString())
+	source.CreateColumn("cnt", ForInt())
+
+	target := NewCollection()
+	target.CreateColumn("id", ForString())
+	target.CreateColumn("cnt", ForInt())
+
+	go func() {
+		for change := range w {
+			target.Replay(change)
+		}
+	}()
+
+	source.Insert(func(r Row) error {
+		r.SetAny("id", "bob")
+		r.SetInt("cnt", 2)
+		return nil
+	})
+
+	// give the replica stream a moment
+	time.Sleep(100 * time.Millisecond)
+
+	target.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.Count())
+		return nil
+	})
+}
+
+// --------------------------- Create/Drop Trigger ----------------------------
+
+func TestTriggerCreate(t *testing.T) {
+	updates := make([]string, 0, 128)
+	players := loadPlayers(500)
+	players.CreateTrigger("on_balance", "balance", func(r Reader) {
+		switch {
+		case r.IsDelete():
+			updates = append(updates, fmt.Sprintf("delete %d", r.Index()))
+		case r.IsUpsert():
+			updates = append(updates, fmt.Sprintf("upsert %d=%v", r.Index(), r.Float()))
+		}
+	})
+
+	// Perform a few deletions and insertions
+	for i := 0; i < 3; i++ {
+		players.DeleteAt(uint32(i))
+		players.Insert(func(r Row) error {
+			r.SetFloat64("balance", 50.0)
+			return nil
+		})
+	}
+
+	// Must keep track of all operations
+	assert.Len(t, updates, 6)
+	assert.Equal(t, []string{"delete 0", "upsert 500=50", "delete 1", "upsert 501=50", "delete 2", "upsert 502=50"}, updates)
+	assert.NoError(t, players.DropTrigger("on_balance"))
+
+	// Must not drop if doesn't exist or not a trigger
+	assert.Error(t, players.DropTrigger("on_balance"))
+	assert.Error(t, players.DropTrigger("balance"))
+
+	// After dropping, should not trigger anymore
+	players.DeleteAt(100)
+	assert.Len(t, updates, 6)
+}
+
+func TestTriggerInvalid(t *testing.T) {
+	players := newEmpty(10)
+	assert.Error(t, players.CreateTrigger("on_balance", "invalid", func(r Reader) {}))
+	assert.Error(t, players.CreateTrigger("", "", nil))
+}
+
+func TestTriggerImpl(t *testing.T) {
+	column := newTrigger("test", "target", func(r Reader) {}).Column
+	v, ok := column.Value(0)
+
+	assert.Nil(t, v)
+	assert.False(t, ok)
+	assert.False(t, column.Contains(0))
+	assert.Nil(t, column.Index(0))
+	assert.NotPanics(t, func() {
+		column.Grow(100)
+		column.Snapshot(0, nil)
+	})
+}
+
 // --------------------------- Mocks & Fixtures ----------------------------
 
 // loadPlayers loads a list of players from the fixture
@@ -539,16 +895,34 @@ func loadPlayers(amount int) *Collection {
 	out := newEmpty(amount)
 
 	// Load and copy until we reach the amount required
-	data := loadFixture("players.json")
+	data := fixtures.Players()
 	for i := 0; i < amount/len(data); i++ {
-		out.Query(func(txn *Txn) error {
-			for _, p := range data {
-				txn.InsertObject(p)
-			}
-			return nil
-		})
+		insertPlayers(out, data)
 	}
 	return out
+}
+
+func insertPlayers(dst *Collection, data []fixtures.Player) error {
+	return dst.Query(func(txn *Txn) error {
+		for _, v := range data {
+			txn.Insert(func(r Row) error {
+				r.SetString("serial", v.Serial)
+				r.SetString("name", v.Name)
+				r.SetBool("active", v.Active)
+				r.SetEnum("class", v.Class)
+				r.SetEnum("race", v.Race)
+				r.SetInt("age", v.Age)
+				r.SetInt("hp", v.Hp)
+				r.SetInt("mp", v.Mp)
+				r.SetFloat64("balance", v.Balance)
+				r.SetEnum("gender", v.Gender)
+				r.SetEnum("guild", v.Guild)
+				r.SetRecord("location", &v.Location)
+				return nil
+			})
+		}
+		return nil
+	})
 }
 
 // newEmpty creates a new empty collection for a the fixture
@@ -560,18 +934,20 @@ func newEmpty(capacity int) *Collection {
 	})
 
 	// Load the items into the collection
-	out.CreateColumn("serial", ForKey())
-	out.CreateColumn("name", ForEnum())
+	out.CreateColumn("serial", ForString())
+	out.CreateColumn("name", ForString())
 	out.CreateColumn("active", ForBool())
 	out.CreateColumn("class", ForEnum())
 	out.CreateColumn("race", ForEnum())
-	out.CreateColumn("age", ForFloat64())
-	out.CreateColumn("hp", ForFloat64())
-	out.CreateColumn("mp", ForFloat64())
+	out.CreateColumn("age", ForInt())
+	out.CreateColumn("hp", ForInt())
+	out.CreateColumn("mp", ForInt())
 	out.CreateColumn("balance", ForFloat64())
 	out.CreateColumn("gender", ForEnum())
 	out.CreateColumn("guild", ForEnum())
-	//out.CreateColumn("location", ForString())
+	out.CreateColumn("location", ForRecord(func() *fixtures.Location {
+		return new(fixtures.Location)
+	}))
 
 	// index on humans
 	out.CreateIndex("human", "race", func(r Reader) bool {
@@ -600,23 +976,29 @@ func newEmpty(capacity int) *Collection {
 
 	// index for old
 	out.CreateIndex("old", "age", func(r Reader) bool {
-		return r.Float() >= 30
+		return r.Int() >= 30
 	})
 
 	return out
 }
 
-// loadFixture loads a fixture by its name
-func loadFixture(name string) []Object {
-	b, err := os.ReadFile("fixtures/" + name)
-	if err != nil {
-		panic(err)
-	}
+// --------------------------- Mock Record ----------------------------
 
-	var data []Object
-	if err := json.Unmarshal(b, &data); err != nil {
-		panic(err)
-	}
+type mockRecord struct {
+	errDecode bool
+	errEncode bool
+}
 
-	return data
+func (r mockRecord) MarshalBinary() ([]byte, error) {
+	if r.errEncode {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return []byte("OK"), nil
+}
+
+func (r mockRecord) UnmarshalBinary(b []byte) error {
+	if r.errDecode {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }

@@ -6,6 +6,7 @@ package column
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/kelindar/bitmap"
 	"github.com/kelindar/column/commit"
@@ -19,51 +20,31 @@ var _ Textual = new(columnEnum)
 
 // columnEnum represents a string column
 type columnEnum struct {
-	fill bitmap.Bitmap // The fill-list
-	locs []uint32      // The list of locations
-	seek *intmap.Sync  // The hash->location table
-	data []string      // The string data
+	chunks[uint32]
+	seek *intmap.Sync // The hash->location table
+	data []string     // The string data
 }
 
 // makeEnum creates a new column
 func makeEnum() Column {
 	return &columnEnum{
-		fill: make(bitmap.Bitmap, 0, 4),
-		locs: make([]uint32, 0, 64),
-		seek: intmap.NewSync(64, .95),
-		data: make([]string, 0, 64),
+		chunks: make(chunks[uint32], 0, 4),
+		seek:   intmap.NewSync(64, .95),
+		data:   make([]string, 0, 64),
 	}
-}
-
-// Grow grows the size of the column until we have enough to store
-func (c *columnEnum) Grow(idx uint32) {
-	if idx < uint32(len(c.locs)) {
-		return
-	}
-
-	if idx < uint32(cap(c.locs)) {
-		c.fill.Grow(idx)
-		c.locs = c.locs[:idx+1]
-		return
-	}
-
-	c.fill.Grow(idx)
-	clone := make([]uint32, idx+1, resize(cap(c.locs), idx+1))
-	copy(clone, c.locs)
-	c.locs = clone
 }
 
 // Apply applies a set of operations to the column.
-func (c *columnEnum) Apply(r *commit.Reader) {
+func (c *columnEnum) Apply(chunk commit.Chunk, r *commit.Reader) {
+	fill, locs := c.chunkAt(chunk)
 	for r.Next() {
+		offset := r.IndexAtChunk()
 		switch r.Type {
 		case commit.Put:
-			// Set the value at the index
-			c.fill[r.Offset>>6] |= 1 << (r.Offset & 0x3f)
-			c.locs[r.Offset] = c.findOrAdd(r.Bytes())
-
+			fill[offset>>6] |= 1 << (offset & 0x3f)
+			locs[offset] = c.findOrAdd(r.Bytes())
 		case commit.Delete:
-			c.fill.Remove(r.Index())
+			fill.Remove(offset)
 			// TODO: remove unused strings, need some reference counting for that
 			// and can proably be done during vacuum() instead
 		}
@@ -92,15 +73,22 @@ func (c *columnEnum) Value(idx uint32) (v interface{}, ok bool) {
 
 // LoadString retrieves a value at a specified index
 func (c *columnEnum) LoadString(idx uint32) (v string, ok bool) {
-	if idx < uint32(len(c.locs)) && c.fill.Contains(idx) {
-		v, ok = c.readAt(c.locs[idx]), true
+	chunk := commit.ChunkAt(idx)
+	index := idx - chunk.Min()
+	if int(chunk) < len(c.chunks) && c.chunks[chunk].fill.Contains(index) {
+		v, ok = c.readAt(c.chunks[chunk].data[index]), true
 	}
 	return
 }
 
 // FilterString filters down the values based on the specified predicate. The column for
 // this filter must be a string.
-func (c *columnEnum) FilterString(offset uint32, index bitmap.Bitmap, predicate func(v string) bool) {
+func (c *columnEnum) FilterString(chunk commit.Chunk, index bitmap.Bitmap, predicate func(v string) bool) {
+	if int(chunk) >= len(c.chunks) {
+		return
+	}
+
+	fill, locs := c.chunkAt(chunk)
 	cache := struct {
 		index uint32 // Last seen offset
 		value bool   // Last evaluated predicate
@@ -111,13 +99,12 @@ func (c *columnEnum) FilterString(offset uint32, index bitmap.Bitmap, predicate 
 
 	// Do a quick ellimination of elements which are NOT contained in this column, this
 	// allows us not to check contains during the filter itself
-	index.And(c.fill[offset>>6 : int(offset>>6)+len(index)])
+	index.And(fill)
 
 	// Filters down the strings, if strings repeat we avoid reading every time by
 	// caching the last seen index/value combination.
 	index.Filter(func(idx uint32) bool {
-		idx = offset + idx
-		if at := c.locs[idx]; at != cache.index {
+		if at := locs[idx]; at != cache.index {
 			cache.index = at
 			cache.value = predicate(c.readAt(at))
 			return cache.value
@@ -130,66 +117,34 @@ func (c *columnEnum) FilterString(offset uint32, index bitmap.Bitmap, predicate 
 
 // Contains checks whether the column has a value at a specified index.
 func (c *columnEnum) Contains(idx uint32) bool {
-	return c.fill.Contains(idx)
-}
-
-// Index returns the fill list for the column
-func (c *columnEnum) Index() *bitmap.Bitmap {
-	return &c.fill
+	chunk := commit.ChunkAt(idx)
+	return c.chunks[chunk].fill.Contains(idx - chunk.Min())
 }
 
 // Snapshot writes the entire column into the specified destination buffer
 func (c *columnEnum) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
-	chunk.Range(c.fill, func(idx uint32) {
-		dst.PutString(commit.Put, idx, c.readAt(c.locs[idx]))
+	fill, locs := c.chunkAt(chunk)
+	fill.Range(func(idx uint32) {
+		dst.PutString(commit.Put, idx, c.readAt(locs[idx]))
 	})
 }
 
-// enumReader represents a read-only accessor for enum strings
-type enumReader struct {
-	cursor *uint32
-	reader *columnEnum
-}
-
-// Get loads the value at the current transaction cursor
-func (s enumReader) Get() (string, bool) {
-	return s.reader.LoadString(*s.cursor)
-}
-
-// enumReaderFor creates a new enum string reader
-func enumReaderFor(txn *Txn, columnName string) enumReader {
-	column, ok := txn.columnAt(columnName)
-	if !ok {
-		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
-	}
-
-	reader, ok := column.Column.(*columnEnum)
-	if !ok {
-		panic(fmt.Errorf("column: column '%s' is not of type string", columnName))
-	}
-
-	return enumReader{
-		cursor: &txn.cursor,
-		reader: reader,
-	}
-}
-
-// slice accessor for enums
-type enumSlice struct {
-	enumReader
+// rwEnum represents read-write accessor for enum
+type rwEnum struct {
+	rdString[*columnEnum]
 	writer *commit.Buffer
 }
 
 // Set sets the value at the current transaction cursor
-func (s enumSlice) Set(value string) {
+func (s rwEnum) Set(value string) {
 	s.writer.PutString(commit.Put, *s.cursor, value)
 }
 
 // Enum returns a enumerable column accessor
-func (txn *Txn) Enum(columnName string) enumSlice {
-	return enumSlice{
-		enumReader: enumReaderFor(txn, columnName),
-		writer:     txn.bufferFor(columnName),
+func (txn *Txn) Enum(columnName string) rwEnum {
+	return rwEnum{
+		rdString: readStringOf[*columnEnum](txn, columnName),
+		writer:   txn.bufferFor(columnName),
 	}
 }
 
@@ -199,137 +154,208 @@ var _ Textual = new(columnString)
 
 // columnString represents a string column
 type columnString struct {
-	fill bitmap.Bitmap // The fill-list
-	data []string      // The actual values
+	chunks[string]
+	option[string]
 }
 
 // makeString creates a new string column
-func makeStrings() Column {
+func makeStrings(opts ...func(*option[string])) Column {
 	return &columnString{
-		fill: make(bitmap.Bitmap, 0, 4),
-		data: make([]string, 0, 64),
+		chunks: make(chunks[string], 0, 4),
+		option: configure(opts, option[string]{
+			Merge: func(_, delta string) string { return delta },
+		}),
 	}
-}
-
-// Grow grows the size of the column until we have enough to store
-func (c *columnString) Grow(idx uint32) {
-	if idx < uint32(len(c.data)) {
-		return
-	}
-
-	if idx < uint32(cap(c.data)) {
-		c.fill.Grow(idx)
-		c.data = c.data[:idx+1]
-		return
-	}
-
-	c.fill.Grow(idx)
-	clone := make([]string, idx+1, resize(cap(c.data), idx+1))
-	copy(clone, c.data)
-	c.data = clone
 }
 
 // Apply applies a set of operations to the column.
-func (c *columnString) Apply(r *commit.Reader) {
+func (c *columnString) Apply(chunk commit.Chunk, r *commit.Reader) {
+	fill, data := c.chunkAt(chunk)
+	from := chunk.Min()
 
 	// Update the values of the column, for this one we can only process stores
 	for r.Next() {
+		offset := r.Offset - int32(from)
 		switch r.Type {
 		case commit.Put:
-			c.fill[r.Offset>>6] |= 1 << (r.Offset & 0x3f)
-			c.data[r.Offset] = string(r.Bytes())
+			fill[offset>>6] |= 1 << (offset & 0x3f)
+			data[offset] = string(r.Bytes())
+		case commit.Merge:
+			fill[offset>>6] |= 1 << (offset & 0x3f)
+			data[offset] = r.SwapString(c.Merge(data[offset], r.String()))
 		case commit.Delete:
-			c.fill.Remove(r.Index())
+			fill.Remove(uint32(offset))
 		}
 	}
 }
 
 // Value retrieves a value at a specified index
 func (c *columnString) Value(idx uint32) (v interface{}, ok bool) {
-	if idx < uint32(len(c.data)) && c.fill.Contains(idx) {
-		v, ok = c.data[idx], true
-	}
-	return
+	return c.LoadString(idx)
 }
 
 // Contains checks whether the column has a value at a specified index.
 func (c *columnString) Contains(idx uint32) bool {
-	return c.fill.Contains(idx)
-}
-
-// Index returns the fill list for the column
-func (c *columnString) Index() *bitmap.Bitmap {
-	return &c.fill
+	chunk := commit.ChunkAt(idx)
+	index := idx - chunk.Min()
+	return c.chunks[chunk].fill.Contains(index)
 }
 
 // LoadString retrieves a value at a specified index
-func (c *columnString) LoadString(idx uint32) (string, bool) {
-	v, has := c.Value(idx)
-	s, ok := v.(string)
-	return s, has && ok
+func (c *columnString) LoadString(idx uint32) (v string, ok bool) {
+	chunk := commit.ChunkAt(idx)
+	index := idx - chunk.Min()
+
+	if int(chunk) < len(c.chunks) && c.chunks[chunk].fill.Contains(index) {
+		v, ok = c.chunks[chunk].data[index], true
+	}
+	return
 }
 
 // FilterString filters down the values based on the specified predicate. The column for
 // this filter must be a string.
-func (c *columnString) FilterString(offset uint32, index bitmap.Bitmap, predicate func(v string) bool) {
-	index.And(c.fill[offset>>6 : int(offset>>6)+len(index)])
-	index.Filter(func(idx uint32) (match bool) {
-		idx = offset + idx
-		return idx < uint32(len(c.data)) && predicate(c.data[idx])
-	})
+func (c *columnString) FilterString(chunk commit.Chunk, index bitmap.Bitmap, predicate func(v string) bool) {
+	if int(chunk) < len(c.chunks) {
+		fill, data := c.chunkAt(chunk)
+		index.And(fill)
+		index.Filter(func(idx uint32) bool {
+			return predicate(data[idx])
+		})
+	}
 }
 
 // Snapshot writes the entire column into the specified destination buffer
 func (c *columnString) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
-	chunk.Range(c.fill, func(idx uint32) {
-		dst.PutString(commit.Put, idx, c.data[idx])
+	fill, data := c.chunkAt(chunk)
+	fill.Range(func(x uint32) {
+		dst.PutString(commit.Put, chunk.Min()+x, data[x])
 	})
 }
 
-// stringReader represents a read-only accessor for strings
-type stringReader struct {
-	cursor *uint32
-	reader *columnString
-}
-
-// Get loads the value at the current transaction cursor
-func (s stringReader) Get() (string, bool) {
-	return s.reader.LoadString(*s.cursor)
-}
-
-// stringReaderFor creates a new string reader
-func stringReaderFor(txn *Txn, columnName string) stringReader {
-	column, ok := txn.columnAt(columnName)
-	if !ok {
-		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
-	}
-
-	reader, ok := column.Column.(*columnString)
-	if !ok {
-		panic(fmt.Errorf("column: column '%s' is not of type string", columnName))
-	}
-
-	return stringReader{
-		cursor: &txn.cursor,
-		reader: reader,
-	}
-}
-
-// stringWriter represents read-write accessor for strings
-type stringWriter struct {
-	stringReader
+// rwString represents read-write accessor for strings
+type rwString struct {
+	rdString[*columnString]
 	writer *commit.Buffer
 }
 
 // Set sets the value at the current transaction cursor
-func (s stringWriter) Set(value string) {
+func (s rwString) Set(value string) {
 	s.writer.PutString(commit.Put, *s.cursor, value)
 }
 
+// Merge merges the value at the current transaction cursor
+func (s rwString) Merge(value string) {
+	s.writer.PutString(commit.Merge, *s.cursor, value)
+}
+
 // String returns a string column accessor
-func (txn *Txn) String(columnName string) stringWriter {
-	return stringWriter{
-		stringReader: stringReaderFor(txn, columnName),
-		writer:       txn.bufferFor(columnName),
+func (txn *Txn) String(columnName string) rwString {
+	return rwString{
+		rdString: readStringOf[*columnString](txn, columnName),
+		writer:   txn.bufferFor(columnName),
 	}
+}
+
+// --------------------------- Key ----------------------------
+
+// columnKey represents the primary key column implementation
+type columnKey struct {
+	columnString
+	name string            // Name of the column
+	lock sync.RWMutex      // Lock to protect the lookup table
+	seek map[string]uint32 // Lookup table for O(1) index seek
+}
+
+// makeKey creates a new primary key column
+func makeKey() Column {
+	return &columnKey{
+		seek: make(map[string]uint32, 64),
+		columnString: columnString{
+			chunks: make(chunks[string], 0, 4),
+		},
+	}
+}
+
+// Apply applies a set of operations to the column.
+func (c *columnKey) Apply(chunk commit.Chunk, r *commit.Reader) {
+	fill, data := c.chunkAt(chunk)
+	from := chunk.Min()
+
+	for r.Next() {
+		offset := r.Offset - int32(from)
+		switch r.Type {
+		case commit.Put:
+			value := string(r.Bytes())
+
+			fill[offset>>6] |= 1 << (offset & 0x3f)
+			data[offset] = value
+			c.lock.Lock()
+			c.seek[value] = uint32(r.Offset)
+			c.lock.Unlock()
+
+		case commit.Delete:
+			fill.Remove(uint32(offset))
+			c.lock.Lock()
+			delete(c.seek, string(data[offset]))
+			c.lock.Unlock()
+		}
+	}
+}
+
+// OffsetOf returns the offset for a particular value
+func (c *columnKey) OffsetOf(v string) (uint32, bool) {
+	c.lock.RLock()
+	idx, ok := c.seek[v]
+	c.lock.RUnlock()
+	return idx, ok
+}
+
+// rwKey represents read-write accessor for primary keys.
+type rwKey struct {
+	cursor *uint32
+	writer *commit.Buffer
+	reader *columnKey
+}
+
+// Set sets the value at the current transaction index
+func (s rwKey) Set(value string) error {
+	if _, ok := s.reader.OffsetOf(value); !ok {
+		s.writer.PutString(commit.Put, *s.cursor, value)
+		return nil
+	}
+
+	return fmt.Errorf("column: unable to set duplicate key '%s'", value)
+}
+
+// Get loads the value at the current transaction index
+func (s rwKey) Get() (string, bool) {
+	return s.reader.LoadString(*s.cursor)
+}
+
+// Enum returns a enumerable column accessor
+func (txn *Txn) Key() rwKey {
+	if txn.owner.pk == nil {
+		panic(fmt.Errorf("column: primary key column does not exist"))
+	}
+
+	return rwKey{
+		cursor: &txn.cursor,
+		writer: txn.bufferFor(txn.owner.pk.name),
+		reader: txn.owner.pk,
+	}
+}
+
+// --------------------------- Reader ----------------------------
+
+// rdString represents a read-only accessor for strings
+type rdString[T Textual] reader[T]
+
+// Get loads the value at the current transaction cursor
+func (s rdString[T]) Get() (string, bool) {
+	return s.reader.LoadString(*s.cursor)
+}
+
+// readStringOf creates a new string reader
+func readStringOf[T Textual](txn *Txn, columnName string) rdString[T] {
+	return rdString[T](readerFor[T](txn, columnName))
 }

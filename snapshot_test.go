@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -17,13 +18,14 @@ import (
 
 	"github.com/kelindar/async"
 	"github.com/kelindar/column/commit"
+	"github.com/klauspost/compress/s2"
 	"github.com/stretchr/testify/assert"
 )
 
 /*
 cpu: Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz
-BenchmarkSave/write-to-8         	       8	 131800350 ns/op	 981.98 MB/s	 6539521 B/op	    1950 allocs/op
-BenchmarkSave/read-from-8        	      13	  79411685 ns/op	1629.80 MB/s	135661336 B/op	    4610 allocs/op
+BenchmarkSave/write-state-8		10	 108239410 ns/op	1250.99 MB/s	41891580 B/op	     817 allocs/op
+BenchmarkSave/read-state-8		22	  55612727 ns/op	2434.82 MB/s	140954620 B/op	    3247 allocs/op
 */
 func BenchmarkSave(b *testing.B) {
 	b.Run("write-state", func(b *testing.B) {
@@ -100,7 +102,9 @@ func runReplication(t *testing.T, updates, inserts, concurrency int) {
 
 		// Write some objects
 		for i := 0; i < inserts; i++ {
-			primary.InsertObject(object)
+			primary.Insert(func(r Row) error {
+				return r.SetMany(object)
+			})
 		}
 
 		work := make(chan async.Task)
@@ -138,7 +142,9 @@ func runReplication(t *testing.T, updates, inserts, concurrency int) {
 
 				// Randomly insert an item
 				if rand.Int31n(5) == 0 {
-					primary.InsertObject(object)
+					primary.Insert(func(r Row) error {
+						return r.SetMany(object)
+					})
 				}
 				return nil, nil
 			})
@@ -180,7 +186,7 @@ func TestSnapshot(t *testing.T) {
 	go func() {
 		for i := 0; i < amount; i++ {
 			assert.NoError(t, input.QueryAt(uint32(i), func(r Row) error {
-				r.SetEnum("name", "Roman")
+				r.SetString("name", "Roman")
 				return nil
 			}))
 			wg.Done()
@@ -195,6 +201,20 @@ func TestSnapshot(t *testing.T) {
 	wg.Wait()
 	output := newEmpty(amount)
 	assert.NoError(t, output.Restore(buffer))
+	assert.Equal(t, amount, output.Count())
+}
+
+func TestLargeSnapshot(t *testing.T) {
+	const amount = 3_000_000
+
+	encoded, err := os.ReadFile("fixtures/3million.bin.s2")
+	assert.NoError(t, err)
+	input, err := s2.Decode(nil, encoded)
+	assert.NoError(t, err)
+
+	// Restore the snapshot
+	output := newEmpty(amount)
+	assert.NoError(t, output.Restore(bytes.NewBuffer(input)))
 	assert.Equal(t, amount, output.Count())
 }
 
@@ -234,6 +254,53 @@ func TestSnapshotFailedAppendCommit(t *testing.T) {
 		return nil
 	})
 	assert.NoError(t, err)
+}
+
+func TestSnapshotDoubleApply(t *testing.T) {
+	amount := 500
+	input := loadPlayers(amount)
+	var startVal int
+
+	// Op 1
+	input.QueryAt(0, func(r Row) error {
+		age, _ := r.Int("age")
+		startVal = age
+
+		r.MergeInt("age", 1)
+		return nil
+	})
+
+	// Save snapshot with Op 1
+	buffer := bytes.NewBuffer(nil)
+	assert.NoError(t, input.Snapshot(buffer))
+
+	// Op 2
+	input.QueryAt(0, func(r Row) error {
+		r.MergeInt("age", 1)
+		return nil
+	})
+
+	// Save snapshot with Op 2
+	buffer2 := bytes.NewBuffer(nil)
+	assert.NoError(t, input.Snapshot(buffer2))
+
+	// Apply Snapshot 1, check for op 1
+	output := newEmpty(amount)
+	assert.NoError(t, output.Restore(buffer))
+	output.QueryAt(0, func(r Row) error {
+		age, _ := r.Int("age")
+		assert.Equal(t, startVal+1, age)
+		return nil
+	})
+
+	// Apply Snapshot 2, check for op 2
+	// Verify that only second delete is applied, not both
+	assert.NoError(t, output.Restore(buffer2))
+	output.QueryAt(0, func(r Row) error {
+		age, _ := r.Int("age")
+		assert.Equal(t, startVal+2, age)
+		return nil
+	})
 }
 
 // --------------------------- State Codec ----------------------------

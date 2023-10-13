@@ -1,8 +1,6 @@
 // Copyright (c) Roman Atachiants and contributors. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for details.
 
-//go:generate genny -pkg=column -in=column_generate.go -out=column_numbers.go gen "number=float32,float64,int,int16,int32,int64,uint,uint16,uint32,uint64"
-
 package column
 
 import (
@@ -39,10 +37,10 @@ func typeOf(column Column) (typ columnType) {
 // Column represents a column implementation
 type Column interface {
 	Grow(idx uint32)
-	Apply(*commit.Reader)
+	Apply(commit.Chunk, *commit.Reader)
 	Value(idx uint32) (interface{}, bool)
 	Contains(idx uint32) bool
-	Index() *bitmap.Bitmap
+	Index(commit.Chunk) bitmap.Bitmap
 	Snapshot(chunk commit.Chunk, dst *commit.Buffer)
 }
 
@@ -52,16 +50,16 @@ type Numeric interface {
 	LoadFloat64(uint32) (float64, bool)
 	LoadUint64(uint32) (uint64, bool)
 	LoadInt64(uint32) (int64, bool)
-	FilterFloat64(uint32, bitmap.Bitmap, func(v float64) bool)
-	FilterUint64(uint32, bitmap.Bitmap, func(v uint64) bool)
-	FilterInt64(uint32, bitmap.Bitmap, func(v int64) bool)
+	FilterFloat64(commit.Chunk, bitmap.Bitmap, func(v float64) bool)
+	FilterUint64(commit.Chunk, bitmap.Bitmap, func(v uint64) bool)
+	FilterInt64(commit.Chunk, bitmap.Bitmap, func(v int64) bool)
 }
 
 // Textual represents a column that stores strings.
 type Textual interface {
 	Column
 	LoadString(uint32) (string, bool)
-	FilterString(uint32, bitmap.Bitmap, func(v string) bool)
+	FilterString(commit.Chunk, bitmap.Bitmap, func(v string) bool)
 }
 
 // --------------------------- Constructors ----------------------------
@@ -116,6 +114,29 @@ func ForKind(kind reflect.Kind) (Column, error) {
 	}
 }
 
+// --------------------------- Generic Options ----------------------------
+
+// option represents options for variouos columns.
+type option[T any] struct {
+	Merge func(value, delta T) T
+}
+
+// configure applies options
+func configure[T any](opts []func(*option[T]), dst option[T]) option[T] {
+	for _, fn := range opts {
+		fn(&dst)
+	}
+	return dst
+}
+
+// WithMerge sets an optional merge function that allows you to merge a delta value to
+// an existing value, atomically. The operation is performed transactionally.
+func WithMerge[T any](fn func(value, delta T) T) func(*option[T]) {
+	return func(v *option[T]) {
+		v.Merge = fn
+	}
+}
+
 // --------------------------- Column ----------------------------
 
 // column represents a column wrapper that synchronizes operations
@@ -160,12 +181,19 @@ func (c *column) Grow(idx uint32) {
 }
 
 // Apply performs a series of operations on a column.
-func (c *column) Apply(r *commit.Reader) {
+func (c *column) Apply(chunk commit.Chunk, r *commit.Reader) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
 	r.Rewind()
-	c.Column.Apply(r)
+	c.Column.Apply(chunk, r)
+}
+
+// Index loads the appropriate column index for a given chunk
+func (c *column) Index(chunk commit.Chunk) bitmap.Bitmap {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.Column.Index(chunk)
 }
 
 // Snapshot takes a snapshot of a column, skipping indexes
@@ -185,168 +213,103 @@ func (c *column) Value(idx uint32) (v interface{}, ok bool) {
 	return
 }
 
-// --------------------------- booleans ----------------------------
+// --------------------------- Accessor  ----------------------------
 
-// columnBool represents a boolean column
-type columnBool struct {
-	data bitmap.Bitmap
-}
-
-// makeBools creates a new boolean column
-func makeBools() Column {
-	return &columnBool{
-		data: make(bitmap.Bitmap, 0, 4),
-	}
-}
-
-// Grow grows the size of the column until we have enough to store
-func (c *columnBool) Grow(idx uint32) {
-	c.data.Grow(idx)
-}
-
-// Apply applies a set of operations to the column.
-func (c *columnBool) Apply(r *commit.Reader) {
-	for r.Next() {
-		v := uint64(1) << (r.Offset & 0x3f)
-		switch r.Type {
-		case commit.PutTrue:
-			c.data[r.Offset>>6] |= v
-		case commit.PutFalse: // also "delete"
-			c.data[r.Offset>>6] &^= v
-		}
-	}
-}
-
-// Value retrieves a value at a specified index
-func (c *columnBool) Value(idx uint32) (interface{}, bool) {
-	value := c.data.Contains(idx)
-	return value, value
-}
-
-// Contains checks whether the column has a value at a specified index.
-func (c *columnBool) Contains(idx uint32) bool {
-	return c.data.Contains(idx)
-}
-
-// Index returns the fill list for the column
-func (c *columnBool) Index() *bitmap.Bitmap {
-	return &c.data
-}
-
-// Snapshot writes the entire column into the specified destination buffer
-func (c *columnBool) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
-	dst.PutBitmap(commit.PutTrue, chunk, c.data)
-}
-
-// boolReader represents a read-only accessor for boolean values
-type boolReader struct {
+// Reader represents a generic reader
+type reader[T any] struct {
 	cursor *uint32
-	reader Column
+	reader T
 }
 
-// Get loads the value at the current transaction cursor
-func (s boolReader) Get() bool {
-	return s.reader.Contains(*s.cursor)
-}
-
-// boolReaderFor creates a new reader
-func boolReaderFor(txn *Txn, columnName string) boolReader {
+// readerFor creates a read-only accessor
+func readerFor[T any](txn *Txn, columnName string) reader[T] {
 	column, ok := txn.columnAt(columnName)
 	if !ok {
 		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
 	}
 
-	return boolReader{
+	target, ok := column.Column.(T)
+	if !ok {
+		var want T
+		panic(fmt.Errorf("column: column '%s' is not of specified type (has=%T, want=%T)",
+			columnName, column.Column, want))
+	}
+
+	return reader[T]{
 		cursor: &txn.cursor,
-		reader: column.Column,
+		reader: target,
 	}
 }
 
-// boolWriter represents read-write accessor for boolean values
-type boolWriter struct {
-	boolReader
+// --------------------------- Any Writer ----------------------------
+
+// rwAny represents read-write accessor for any column type
+type rwAny struct {
+	rdAny
 	writer *commit.Buffer
 }
 
 // Set sets the value at the current transaction cursor
-func (s boolWriter) Set(value bool) {
-	s.writer.PutBool(*s.cursor, value)
+func (s rwAny) Set(value any) error {
+	return s.writer.PutAny(commit.Put, *s.cursor, value)
 }
 
-// Bool returns a bool column accessor
-func (txn *Txn) Bool(columnName string) boolWriter {
-	return boolWriter{
-		boolReader: boolReaderFor(txn, columnName),
-		writer:     txn.bufferFor(columnName),
-	}
-}
+// --------------------------- Any Reader ----------------------------
 
-// --------------------------- Accessor ----------------------------
-
-// anyReader represents a read-only accessor for any value
-type anyReader struct {
-	cursor *uint32
-	reader Column
-}
+// rdAny represents a read-only accessor for any value
+type rdAny reader[Column]
 
 // Get loads the value at the current transaction cursor
-func (s anyReader) Get() (interface{}, bool) {
+func (s rdAny) Get() (any, bool) {
 	return s.reader.Value(*s.cursor)
 }
 
-// anyReaderFor creates a new any reader
-func anyReaderFor(txn *Txn, columnName string) anyReader {
-	column, ok := txn.columnAt(columnName)
-	if !ok {
-		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
-	}
-
-	return anyReader{
-		cursor: &txn.cursor,
-		reader: column.Column,
-	}
-}
-
-// anyWriter represents read-write accessor for any column type
-type anyWriter struct {
-	anyReader
-	writer *commit.Buffer
-}
-
-// Set sets the value at the current transaction cursor
-func (s anyWriter) Set(value interface{}) {
-	s.writer.PutAny(commit.Put, *s.cursor, value)
+// readAnyOf creates a new any reader
+func readAnyOf(txn *Txn, columnName string) rdAny {
+	return rdAny(readerFor[Column](txn, columnName))
 }
 
 // Any returns a column accessor
-func (txn *Txn) Any(columnName string) anyWriter {
-	return anyWriter{
-		anyReader: anyReaderFor(txn, columnName),
-		writer:    txn.bufferFor(columnName),
+func (txn *Txn) Any(columnName string) rwAny {
+	return rwAny{
+		rdAny:  readAnyOf(txn, columnName),
+		writer: txn.bufferFor(columnName),
 	}
 }
 
-// --------------------------- funcs ----------------------------
+// --------------------------- segment list ----------------------------
 
-// resize calculates the new required capacity and a new index
-func resize(capacity int, v uint32) int {
-	const threshold = 256
-	if v < threshold {
-		v |= v >> 1
-		v |= v >> 2
-		v |= v >> 4
-		v |= v >> 8
-		v |= v >> 16
-		v++
-		return int(v)
-	}
+// Chunks represents a chunked array storage
+type chunks[T any] []struct {
+	fill bitmap.Bitmap // The fill-list
+	data []T           // The actual values
+}
 
-	if capacity < threshold {
-		capacity = threshold
-	}
+// chunkAt loads the fill and data list at a particular chunk
+func (s chunks[T]) chunkAt(chunk commit.Chunk) (bitmap.Bitmap, []T) {
+	fill := s[chunk].fill
+	data := s[chunk].data
+	return fill, data
+}
 
-	for 0 < capacity && capacity < int(v+1) {
-		capacity += (capacity + 3*threshold) / 4
+// Grow grows a segment list
+func (s *chunks[T]) Grow(idx uint32) {
+	chunk := int(commit.ChunkAt(idx))
+	for i := len(*s); i <= chunk; i++ {
+		*s = append(*s, struct {
+			fill bitmap.Bitmap
+			data []T
+		}{
+			fill: make(bitmap.Bitmap, chunkSize/64),
+			data: make([]T, chunkSize),
+		})
 	}
-	return capacity
+}
+
+// Index returns the fill list for the segment
+func (s chunks[T]) Index(chunk commit.Chunk) (fill bitmap.Bitmap) {
+	if int(chunk) < len(s) {
+		fill = s[chunk].fill
+	}
+	return
 }

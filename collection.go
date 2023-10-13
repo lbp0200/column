@@ -17,9 +17,6 @@ import (
 	"github.com/kelindar/smutex"
 )
 
-// Object represents a single object
-type Object = map[string]interface{}
-
 const (
 	expireColumn = "expire"
 	rowColumn    = "row"
@@ -91,10 +88,18 @@ func NewCollection(opts ...Options) *Collection {
 func (c *Collection) next() uint32 {
 	c.lock.Lock()
 	idx := c.findFreeIndex(atomic.AddUint64(&c.count, 1))
-
 	c.fill.Set(idx)
 	c.lock.Unlock()
 	return idx
+}
+
+// free marks the index as free, atomically.
+func (c *Collection) free(idx uint32) {
+	c.lock.Lock()
+	c.fill.Remove(idx)
+	atomic.StoreUint64(&c.count, uint64(c.fill.Count()))
+	c.lock.Unlock()
+	return
 }
 
 // findFreeIndex finds a free index for insertion
@@ -119,39 +124,10 @@ func (c *Collection) findFreeIndex(count uint64) uint32 {
 	return idx
 }
 
-// InsertObject adds an object to a collection and returns the allocated index.
-func (c *Collection) InsertObject(obj Object) (index uint32) {
-	c.Query(func(txn *Txn) error {
-		index, _ = txn.InsertObject(obj)
-		return nil
-	})
-	return
-}
-
-// InsertObjectWithTTL adds an object to a collection, sets the expiration time
-// based on the specified time-to-live and returns the allocated index.
-func (c *Collection) InsertObjectWithTTL(obj Object, ttl time.Duration) (index uint32) {
-	c.Query(func(txn *Txn) error {
-		index, _ = txn.InsertObjectWithTTL(obj, ttl)
-		return nil
-	})
-	return
-}
-
 // Insert executes a mutable cursor transactionally at a new offset.
 func (c *Collection) Insert(fn func(Row) error) (index uint32, err error) {
 	err = c.Query(func(txn *Txn) (innerErr error) {
 		index, innerErr = txn.Insert(fn)
-		return
-	})
-	return
-}
-
-// InsertWithTTL executes a mutable cursor transactionally at a new offset and sets the expiration time
-// based on the specified time-to-live and returns the allocated index.
-func (c *Collection) InsertWithTTL(ttl time.Duration, fn func(Row) error) (index uint32, err error) {
-	err = c.Query(func(txn *Txn) (innerErr error) {
-		index, innerErr = txn.InsertWithTTL(ttl, fn)
 		return
 	})
 	return
@@ -183,9 +159,9 @@ func (c *Collection) createColumnKey(columnName string, column *columnKey) error
 	return nil
 }
 
-// CreateColumnsOf registers a set of columns that are present in the target object.
-func (c *Collection) CreateColumnsOf(object Object) error {
-	for k, v := range object {
+// CreateColumnsOf registers a set of columns that are present in the target map.
+func (c *Collection) CreateColumnsOf(value map[string]any) error {
+	for k, v := range value {
 		column, err := ForKind(reflect.TypeOf(v).Kind())
 		if err != nil {
 			return err
@@ -204,7 +180,13 @@ func (c *Collection) CreateColumn(columnName string, column Column) error {
 		return fmt.Errorf("column: unable to create column '%s', already exists", columnName)
 	}
 
-	column.Grow(uint32(c.opts.Capacity))
+	// Grow the column to the current capacity
+	capacity := uint32(atomic.LoadUint64(&c.count))
+	if c.opts.Capacity > int(capacity) {
+		capacity = uint32(c.opts.Capacity)
+	}
+
+	column.Grow(capacity)
 	c.cols.Store(columnName, columnFor(columnName, column))
 
 	// If necessary, create a primary key column
@@ -220,8 +202,50 @@ func (c *Collection) DropColumn(columnName string) {
 	c.cols.DeleteColumn(columnName)
 }
 
+// CreateTrigger creates an trigger column with a specified name which depends on a given
+// column. The trigger function will be applied on the values of the column whenever
+// a new row is added, updated or deleted.
+func (c *Collection) CreateTrigger(triggerName, columnName string, fn func(r Reader)) error {
+	if fn == nil || columnName == "" || triggerName == "" {
+		return fmt.Errorf("column: create trigger must specify name, column and function")
+	}
+
+	// Prior to creating an index, we should have a column
+	column, ok := c.cols.Load(columnName)
+	if !ok {
+		return fmt.Errorf("column: unable to create trigger, column '%v' does not exist", columnName)
+	}
+
+	// Create and add the trigger column
+	trigger := newTrigger(triggerName, columnName, fn)
+	c.lock.Lock()
+	c.cols.Store(triggerName, trigger)
+	c.cols.Store(columnName, column, trigger)
+	c.lock.Unlock()
+	return nil
+}
+
+// DropTrigger removes the trigger column with the specified name. If the trigger with this
+// name does not exist, this operation is a no-op.
+func (c *Collection) DropTrigger(triggerName string) error {
+	column, exists := c.cols.Load(triggerName)
+	if !exists {
+		return fmt.Errorf("column: unable to drop index, index '%v' does not exist", triggerName)
+	}
+
+	if _, ok := column.Column.(computed); !ok {
+		return fmt.Errorf("column: unable to drop index, '%v' is not a trigger", triggerName)
+	}
+
+	// Figure out the associated column and delete the index from that
+	columnName := column.Column.(computed).Column()
+	c.cols.DeleteIndex(columnName, triggerName)
+	c.cols.DeleteColumn(triggerName)
+	return nil
+}
+
 // CreateIndex creates an index column with a specified name which depends on a given
-// column. The index function will be applied on the values of the column whenever
+// data column. The index function will be applied on the values of the column whenever
 // a new row is added or updated.
 func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader) bool) error {
 	if fn == nil || columnName == "" || indexName == "" {
@@ -250,7 +274,48 @@ func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader)
 	for chunk := commit.Chunk(0); int(chunk) < chunks; chunk++ {
 		if column.Snapshot(chunk, buffer) {
 			reader.Seek(buffer)
-			index.Apply(reader)
+			index.Apply(chunk, reader)
+		}
+	}
+
+	return nil
+}
+
+// CreateSortIndex creates a sorted index column with a specified name which depends
+// on a given data column.
+func (c *Collection) CreateSortIndex(indexName, columnName string) error {
+	if columnName == "" || indexName == "" {
+		return fmt.Errorf("column: create index must specify name & column")
+	}
+
+	// Prior to creating an index, we should have a column
+	column, ok := c.cols.Load(columnName)
+	if !ok {
+		return fmt.Errorf("column: unable to create index, column '%v' does not exist", columnName)
+	}
+
+	// Check to make sure index does not already exist
+	_, ok = c.cols.Load(indexName)
+	if ok {
+		return fmt.Errorf("column: unable to create index, index '%v' already exist", indexName)
+	}
+
+	// Create and add the index column,
+	index := newSortIndex(indexName, columnName)
+	c.lock.Lock()
+	c.cols.Store(indexName, index)
+	c.cols.Store(columnName, column, index)
+	c.lock.Unlock()
+
+	// Iterate over all of the values of the target column, chunk by chunk and fill
+	// the index accordingly.
+	chunks := c.chunks()
+	buffer := commit.NewBuffer(c.Count())
+	reader := commit.NewReader()
+	for chunk := commit.Chunk(0); int(chunk) < chunks; chunk++ {
+		if column.Snapshot(chunk, buffer) {
+			reader.Seek(buffer)
+			index.Apply(chunk, reader)
 		}
 	}
 
@@ -284,14 +349,6 @@ func (c *Collection) QueryAt(idx uint32, fn func(Row) error) error {
 	})
 }
 
-// QueryAt jumps at a particular key in the collection, sets the cursor to the
-// provided position and executes given callback fn.
-func (c *Collection) QueryKey(key string, fn func(Row) error) error {
-	return c.Query(func(txn *Txn) error {
-		return txn.QueryKey(key, fn)
-	})
-}
-
 // Query creates a transaction which allows for filtering and iteration over the
 // columns in this collection. It also allows for individual rows to be modified or
 // deleted during iteration (range), but the actual operations will be queued and
@@ -319,26 +376,34 @@ func (c *Collection) Close() error {
 	return nil
 }
 
-// vacuum cleans up the expired objects on a specified interval.
-func (c *Collection) vacuum(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	for {
-		select {
-		case <-ctx.Done():
-			ticker.Stop()
-			return
-		case <-ticker.C:
-			now := time.Now().UnixNano()
-			c.Query(func(txn *Txn) error {
-				expire := txn.Int64(expireColumn)
-				return txn.With(expireColumn).Range(func(idx uint32) {
-					if expirateAt, ok := expire.Get(); ok && expirateAt != 0 && now >= expirateAt {
-						txn.DeleteAt(idx)
-					}
-				})
-			})
-		}
-	}
+// --------------------------- Primary Key ----------------------------
+
+// InsertKey inserts a row given its corresponding primary key.
+func (c *Collection) InsertKey(key string, fn func(Row) error) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.InsertKey(key, fn)
+	})
+}
+
+// UpsertKey inserts or updates a row given its corresponding primary key.
+func (c *Collection) UpsertKey(key string, fn func(Row) error) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.UpsertKey(key, fn)
+	})
+}
+
+// QueryKey queries/updates a row given its corresponding primary key.
+func (c *Collection) QueryKey(key string, fn func(Row) error) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.QueryKey(key, fn)
+	})
+}
+
+// DeleteKey deletes a row for a given primary key.
+func (c *Collection) DeleteKey(key string) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.DeleteKey(key)
+	})
 }
 
 // --------------------------- column registry ---------------------------
@@ -406,7 +471,7 @@ func (c *columns) Load(columnName string) (*column, bool) {
 	return nil, false
 }
 
-// LoadWithIndex loads a column by its name along with their computed indices.
+// LoadWithIndex loads a column by its name along with the triggers.
 func (c *columns) LoadWithIndex(columnName string) ([]*column, bool) {
 	cols := c.cols.Load().([]columnEntry)
 	for _, v := range cols {

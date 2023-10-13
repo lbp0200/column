@@ -17,13 +17,15 @@ This package contains a **high-performance, columnar, in-memory storage engine**
 - Optimized, cache-friendly **columnar data layout** that minimizes cache-misses.
 - Optimized for **zero heap allocation** during querying (see benchmarks below).
 - Optimized **batch updates/deletes**, an update during a transaction takes around `12ns`.
+- Support for **SIMD-enabled aggregate functions** such as "sum", "avg", "min" and "max".
 - Support for **SIMD-enabled filtering** (i.e. "where" clause) by leveraging [bitmap indexing](https://github.com/kelindar/bitmap).
 - Support for **columnar projection** (i.e. "select" clause) for fast retrieval.
 - Support for **computed indexes** that are dynamically calculated based on provided predicate.
 - Support for **concurrent updates** using sharded latches to keep things fast.
 - Support for **transaction isolation**, allowing you to create transactions and commit/rollback.
 - Support for **expiration** of rows based on time-to-live or expiration column.
-- Support for **atomic increment/decrement** of numerical values, transactionally.
+- Support for **atomic merging** of any values, transactionally.
+- Support for **primary keys** for use-cases where offset can't be used.
 - Support for **change data stream** that streams all commits consistently.
 - Support for **concurrent snapshotting** allowing to store the entire collection into a file.
 
@@ -37,53 +39,45 @@ The general idea is to leverage cache-friendly ways of organizing data in [struc
 - [Updating Values](#updating-values)
 - [Expiring Values](#expiring-values)
 - [Transaction Commit and Rollback](#transaction-commit-and-rollback)
+- [Using Primary Keys](#using-primary-keys)
+- [Storing Binary Records](#storing-binary-records)
 - [Streaming Changes](#streaming-changes)
 - [Snapshot and Restore](#snapshot-and-restore)
-- [Complete Example](#complete-example)
+- [Examples](#examples)
 - [Benchmarks](#benchmarks)
 - [Contributing](#contributing)
 
 ## Collection and Columns
 
-In order to get data into the store, you'll need to first create a `Collection` by calling `NewCollection()` method. Each collection requires a schema, which can be either specified manually by calling `CreateColumn()` multiple times or automatically inferred from an object by calling `CreateColumnsOf()` function.
-
-In the example below we're loading some `JSON` data by using `json.Unmarshal()` and auto-creating colums based on the first element on the loaded slice. After this is done, we can then load our data by inserting the objects one by one into the collection. This is accomplished by calling `InsertObject()` method on the collection itself repeatedly.
+In order to get data into the store, you'll need to first create a `Collection` by calling `NewCollection()` method. Each collection requires a schema, which needs to be specified by calling `CreateColumn()` multiple times or automatically inferred from an object by calling `CreateColumnsOf()` function. In the example below we create a new collection with several columns.
 
 ```go
-data := loadFromJson("players.json")
-
-// Create a new columnar collection
-players := column.NewCollection()
-players.CreateColumnsOf(data[0])
-
-// Insert every item from our loaded data
-for _, v := range data {
-	players.InsertObject(v)
-}
-```
-
-Now, let's say we only want specific columns to be added. We can do this by calling `CreateColumn()` method on the collection manually to create the required columns.
-
-```go
-// Create a new columnar collection with pre-defined columns
+// Create a new collection with some columns
 players := column.NewCollection()
 players.CreateColumn("name", column.ForString())
 players.CreateColumn("class", column.ForString())
 players.CreateColumn("balance", column.ForFloat64())
 players.CreateColumn("age", column.ForInt16())
-
-// Insert every item from our loaded data
-for _, v := range loadFromJson("players.json") {
-	players.InsertObject(v)
-}
 ```
 
-While the previous example demonstrated how to insert many objects, it was doing it one by one and is rather inefficient. This is due to the fact that each `InsertObject()` call directly on the collection initiates a separate transacion and there's a small performance cost associated with it. If you want to do a bulk insert and insert many values, faster, that can be done by calling `Insert()` on a transaction, as demonstrated in the example below. Note that the only difference is instantiating a transaction by calling the `Query()` method and calling the `txn.Insert()` method on the transaction instead the one on the collection.
+Now that we have created a collection, we can insert a single record by using `Insert()` method on the collection. In this example we're inserting a single row and manually specifying values. Note that this function returns an `index` that indicates the row index for the inserted row.
 
 ```go
-players.Query(func(txn *Txn) error {
-	for _, v := range loadFromJson("players.json") {
-		txn.InsertObject(v)
+index, err := players.Insert(func(r column.Row) error {
+	r.SetString("name", "merlin")
+	r.SetString("class", "mage")
+	r.SetFloat64("balance", 99.95)
+	r.SetInt16("age", 107)
+	return nil
+})
+```
+
+While the previous example demonstrated how to insert a single row, inserting multiple rows this way is rather inefficient. This is due to the fact that each `Insert()` call directly on the collection initiates a separate transacion and there's a small performance cost associated with it. If you want to do a bulk insert and insert many values, faster, that can be done by calling `Insert()` on a transaction, as demonstrated in the example below. Note that the only difference is instantiating a transaction by calling the `Query()` method and calling the `txn.Insert()` method on the transaction instead the one on the collection.
+
+```go
+players.Query(func(txn *column.Txn) error {
+	for _, v := range myRawData {
+		txn.Insert(...)
 	}
 	return nil // Commit
 })
@@ -126,7 +120,7 @@ First, let's try to merge two queries by applying a `Union()` operation with the
 
 ```go
 // How many rogues and mages?
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	txn.With("rogue").Union("mage").Count()
 	return nil
 })
@@ -136,7 +130,7 @@ Next, let's count everyone who isn't a rogue, for that we can use a `Without()` 
 
 ```go
 // How many rogues and mages?
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	txn.Without("rogue").Count()
 	return nil
 })
@@ -146,7 +140,7 @@ Now, you can combine all of the methods and keep building more complex queries. 
 
 ```go
 // How many rogues that are over 30 years old?
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	txn.With("rogue").WithFloat("age", func(v float64) bool {
 		return v >= 30
 	}).Count()
@@ -165,7 +159,7 @@ In order to access the results of the iteration, prior to calling `Range()` meth
 In the example below we select all of the rogues from our collection and print out their name by using the `Range()` method and accessing the "name" column using a column reader which is created by calling `txn.String("name")` method.
 
 ```go
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	names := txn.String("name") // Create a column reader
 
 	return txn.With("rogue").Range(func(i uint32) {
@@ -178,7 +172,7 @@ players.Query(func(txn *Txn) error {
 Similarly, if you need to access more columns, you can simply create the appropriate column reader(s) and use them as shown in the example before.
 
 ```go
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	names := txn.String("name")
 	ages  := txn.Int64("age")
 
@@ -192,6 +186,50 @@ players.Query(func(txn *Txn) error {
 })
 ```
 
+Taking the `Sum()` of a (numeric) column reader will take into account a transaction's current filtering index.
+
+```go
+players.Query(func(txn *column.Txn) error {
+	totalAge := txn.With("rouge").Int64("age").Sum()
+	totalRouges := int64(txn.Count())
+
+	avgAge := totalAge / totalRouges
+
+	txn.WithInt("age", func(v float64) bool {
+		return v < avgAge
+	})
+
+	// get total balance for 'all rouges younger than the average rouge'
+	balance := txn.Float64("balance").Sum()
+	return nil
+})
+```
+
+## Sorted Indexes
+
+Along with bitmap indexing, collections support consistently sorted indexes. These indexes are transient, and must be recreated when a collection is loading a snapshot. 
+
+In the example below, we create a SortedIndex object and use it to sort filtered records in a transaction.
+
+```go
+// Create the sorted index "sortedNames" in advance
+out.CreateSortIndex("richest", "balance")
+
+// This filters the transaction with the `rouge` index before
+// ranging through the remaining balances by ascending order
+players.Query(func(txn *column.Txn) error {
+	name    := txn.String("name")
+	balance := txn.Float64("balance")
+
+	txn.With("rogue").Ascend("richest", func (i uint32) {
+		// save or do something with sorted record
+		curName, _ := name.Get()
+		balance.Set(newBalance(curName))
+	})
+	return nil
+})
+```
+
 ## Updating Values
 
 In order to update certain items in the collection, you can simply call `Range()` method and use column accessor's `Set()` or `Add()` methods to update a value of a certain column atomically. The updates won't be instantly reflected given that our store supports transactions. Only when transaction is commited, then the update will be applied to the collection, allowing for isolation and rollbacks.
@@ -199,7 +237,7 @@ In order to update certain items in the collection, you can simply call `Range()
 In the example below we're selecting all of the rogues and updating both their balance and age to certain values. The transaction returns `nil`, hence it will be automatically committed when `Query()` method returns.
 
 ```go
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	balance := txn.Float64("balance")
 	age     := txn.Int64("age")
 
@@ -210,45 +248,68 @@ players.Query(func(txn *Txn) error {
 })
 ```
 
-In certain cases, you might want to atomically increment or decrement numerical values. In order to accomplish this you can use the provided `Add()` operation. Note that the indexes will also be updated accordingly and the predicates re-evaluated with the most up-to-date values. In the below example we're incrementing the balance of all our rogues by _500_ atomically.
+In certain cases, you might want to atomically increment or decrement numerical values. In order to accomplish this you can use the provided `Merge()` operation. Note that the indexes will also be updated accordingly and the predicates re-evaluated with the most up-to-date values. In the below example we're incrementing the balance of all our rogues by _500_ atomically.
 
 ```go
-players.Query(func(txn *Txn) error {
+players.Query(func(txn *column.Txn) error {
 	balance := txn.Float64("balance")
 
 	return txn.With("rogue").Range(func(i uint32) {
-		balance.Add(500.0) // Increment the "balance" by 500
+		balance.Merge(500.0) // Increment the "balance" by 500
 	})
+})
+```
+
+While atomic increment/decrement for numerical values is relatively straightforward, this `Merge()` operation can be specified using `WithMerge()` option and also used for other data types, such as strings. In the example below we are creating a merge function that concatenates two strings together and when `MergeString()` is called, the new string gets appended automatically.
+
+```go
+// A merging function that simply concatenates 2 strings together
+concat := func(value, delta string) string {
+	if len(value) > 0 {
+		value += ", "
+	}
+	return value + delta
+}
+
+// Create a column with a specified merge function
+db := column.NewCollection()
+db.CreateColumn("alphabet", column.ForString(column.WithMerge(concat)))
+
+// Insert letter "A"
+db.Insert(func(r column.Row) error {
+	r.SetString("alphabet", "A") // now contains "A"
+	return nil
+})
+
+// Insert letter "B"
+db.QueryAt(0, func(r column.Row) error {
+	r.MergeString("alphabet", "B") // now contains "A, B"
+	return nil
 })
 ```
 
 ## Expiring Values
 
-Sometimes, it is useful to automatically delete certain rows when you do not need them anymore. In order to do this, the library automatically adds an `expire` column to each new collection and starts a cleanup goroutine aynchronously that runs periodically and cleans up the expired objects. In order to set this, you can simply use `InsertWithTTL()` method on the collection that allows to insert an object with a time-to-live duration defined.
+Sometimes, it is useful to automatically delete certain rows when you do not need them anymore. In order to do this, the library automatically adds an `expire` column to each new collection and starts a cleanup goroutine aynchronously that runs periodically and cleans up the expired objects. In order to set this, you can simply use `Insert...()` method on the collection that allows to insert an object with a time-to-live duration defined.
 
 In the example below we are inserting an object to the collection and setting the time-to-live to _5 seconds_ from the current time. After this time, the object will be automatically evicted from the collection and its space can be reclaimed.
 
 ```go
-players.InsertObjectWithTTL(map[string]interface{}{
-	"name": "Merlin",
-	"class": "mage",
-	"age": 55,
-	"balance": 500,
-}, 5 * time.Second) // The time-to-live of 5 seconds
+players.Insert(func(r column.Row) error {
+	r.SetString("name", "Merlin")
+	r.SetString("class", "mage")
+	r.SetTTL(5 * time.Second) // time-to-live of 5 seconds
+	return nil
+})
 ```
 
-On an interesting note, since `expire` column which is automatically added to each collection is an actual normal column, you can query and even update it. In the example below we query and conditionally update the expiration column. The example loads a time, adds one hour and updates it, but in practice if you want to do it you should use `Add()` method which can perform this atomically.
+On an interesting note, since `expire` column which is automatically added to each collection is an actual normal column, you can query and even update it. In the example below we query and extend the time-to-live by 1 hour using the `Extend()` method.
 
 ```go
 players.Query(func(txn *column.Txn) error {
-	expire := txn.Int64("expire")
-
+	ttl := txn.TTL()
 	return txn.Range(func(i uint32) {
-		if v, ok := expire.Get(); ok && v > 0 {
-			oldExpire := time.Unix(0, v) // Convert expiration to time.Time
-			newExpire := expireAt.Add(1 * time.Hour).UnixNano()  // Add some time
-			expire.Set(newExpire)
-		}
+		ttl.Extend(1 * time.Hour) // Add some time
 	})
 })
 ```
@@ -285,11 +346,80 @@ players.Query(func(txn *column.Txn) error {
 })
 ```
 
+## Using Primary Keys
+
+In certain cases it is useful to access a specific row by its primary key instead of an index which is generated internally by the collection. For such use-cases, the library provides `Key` column type that enables a seamless lookup by a user-defined _primary key_. In the example below we create a collection with a primary key `name` using `CreateColumn()` method with a `ForKey()` column type. Then, we use `InsertKey()` method to insert a value.
+
+```go
+players := column.NewCollection()
+players.CreateColumn("name", column.ForKey())     // Create a "name" as a primary-key
+players.CreateColumn("class", column.ForString()) // .. and some other columns
+
+// Insert a player with "merlin" as its primary key
+players.InsertKey("merlin", func(r column.Row) error {
+	r.SetString("class", "mage")
+	return nil
+})
+```
+
+Similarly, you can use primary key to query that data directly, without knowing the exact offset. Do note that using primary keys will have an overhead, as it requires an additional step of looking up the offset using a hash table managed internally.
+
+```go
+// Query merlin's class
+players.QueryKey("merlin", func(r column.Row) error {
+	class, _ := r.String("class")
+	return nil
+})
+```
+
+## Storing Binary Records
+
+If you find yourself in need of encoding a more complex structure as a single column, you may do so by using `column.ForRecord()` function. This allows you to specify a `BinaryMarshaler` / `BinaryUnmarshaler` type that will get automatically encoded as a single column. In th example below we are creating a `Location` type that implements the required methods.
+
+```go
+type Location struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+func (l Location) MarshalBinary() ([]byte, error) {
+	return json.Marshal(l)
+}
+
+func (l *Location) UnmarshalBinary(b []byte) error {
+	return json.Unmarshal(b, l)
+}
+```
+
+Now that we have a record implementation, we can create a column for this struct by using `ForRecord()` function as shown below.
+
+```go
+players.CreateColumn("location", ForRecord(func() *Location {
+	return new(Location)
+}))
+```
+
+In order to manipulate the record, we can use the appropriate `Record()`, `SetRecord()` methods of the `Row`, similarly to other column types.
+
+```go
+// Insert a new location
+idx, _ := players.Insert(func(r Row) error {
+	r.SetRecord("location", &Location{X: 1, Y: 2})
+	return nil
+})
+
+// Read the location back
+players.QueryAt(idx, func(r Row) error {
+	location, ok := r.Record("location")
+	return nil
+})
+```
+
 ## Streaming Changes
 
-This library also supports streaming out all transaction commits consistently, as they happen. This allows you to implement your own change data capture (CDC) listeners, stream data into kafka or into a remote database for durability. In order to enable it, you can simply provide an implementation of a `commit.Writer` interface during the creation of the collection.
+This library also supports streaming out all transaction commits consistently, as they happen. This allows you to implement your own change data capture (CDC) listeners, stream data into kafka or into a remote database for durability. In order to enable it, you can simply provide an implementation of a `commit.Logger` interface during the creation of the collection.
 
-In the example below we take advantage of the `commit.Channel` implementation of a `commit.Writer` which simply publishes the commits into a go channel. Here we create a buffered channel and keep consuming the commits with a separate goroutine, allowing us to view transactions as they happen in the store.
+In the example below we take advantage of the `commit.Channel` implementation of a `commit.Logger` which simply publishes the commits into a go channel. Here we create a buffered channel and keep consuming the commits with a separate goroutine, allowing us to view transactions as they happen in the store.
 
 ```go
 // Create a new commit writer (simple channel) and a new collection
@@ -300,8 +430,8 @@ players := NewCollection(column.Options{
 
 // Read the changes from the channel
 go func(){
-	for commit := writer{
-		println("commit", commit.ID)
+	for commit := range writer {
+		fmt.Printf("commit %v\n", commit.ID)
 	}
 }()
 
@@ -311,7 +441,7 @@ go func(){
 On a separate note, this change stream is guaranteed to be consistent and serialized. This means that you can also replicate those changes on another database and synchronize both. In fact, this library also provides `Replay()` method on the collection that allows to do just that. In the example below we create two collections `primary` and `replica` and asychronously replicating all of the commits from the `primary` to the `replica` using the `Replay()` method together with the change stream.
 
 ```go
-// Create a p rimary collection
+// Create a primary collection
 writer  := make(commit.Channel, 1024)
 primary := column.NewCollection(column.Options{
 	Writer: &writer,
@@ -358,59 +488,9 @@ if err != nil {
 err := players.Restore(src)
 ```
 
-## Complete Example
+## Examples
 
-```go
-func main(){
-
-	// Create a new columnar collection
-	players := column.NewCollection()
-	players.CreateColumn("serial", column.ForKey())
-	players.CreateColumn("name", column.ForEnum())
-	players.CreateColumn("active", column.ForBool())
-	players.CreateColumn("class", column.ForEnum())
-	players.CreateColumn("race", column.ForEnum())
-	players.CreateColumn("age", column.ForFloat64())
-	players.CreateColumn("hp", column.ForFloat64())
-	players.CreateColumn("mp", column.ForFloat64())
-	players.CreateColumn("balance", column.ForFloat64())
-	players.CreateColumn("gender", column.ForEnum())
-	players.CreateColumn("guild", column.ForEnum())
-
-	// index on humans
-	players.CreateIndex("human", "race", func(r column.Reader) bool {
-		return r.String() == "human"
-	})
-
-	// index for mages
-	players.CreateIndex("mage", "class", func(r column.Reader) bool {
-		return r.String() == "mage"
-	})
-
-	// index for old
-	players.CreateIndex("old", "age", func(r column.Reader) bool {
-		return r.Float() >= 30
-	})
-
-	// Load the items into the collection
-	loaded := loadFixture("players.json")
-	players.Query(func(txn *column.Txn) error {
-		for _, v := range loaded {
-			txn.InsertObject(v)
-		}
-		return nil
-	})
-
-	// Run an indexed query
-	players.Query(func(txn *column.Txn) error {
-		name := txn.Enum("name")
-		return txn.With("human", "mage", "old").Range(func(idx uint32) {
-			value, _ := name.Get()
-			println("old mage, human:", value)
-		})
-	})
-}
-```
+Multiple complete usage examples of this library can be found in the [examples](https://github.com/kelindar/column/tree/main/examples) directory in this repository.
 
 ## Benchmarks
 

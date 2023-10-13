@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/kelindar/bitmap"
 	"github.com/kelindar/column/commit"
@@ -60,7 +61,7 @@ func testColumn(t *testing.T, column Column, value interface{}) {
 
 	// Assert the value
 	v, ok := column.Value(9)
-	assert.Equal(t, 1, column.Index().Count())
+	assert.Equal(t, 1, column.Index(0).Count())
 	assert.True(t, column.Contains(9))
 	assert.Equal(t, value, v)
 	assert.True(t, ok)
@@ -96,7 +97,7 @@ func testColumn(t *testing.T, column Column, value interface{}) {
 		applyChanges(column,
 			Update{Type: commit.Put, Index: 1, Value: value},
 			Update{Type: commit.Put, Index: 2, Value: value},
-			Update{Type: commit.Add, Index: 1, Value: value},
+			Update{Type: commit.Merge, Index: 1, Value: value},
 		)
 
 		assert.True(t, column.Contains(1))
@@ -163,7 +164,7 @@ func testColumn(t *testing.T, column Column, value interface{}) {
 		applyChanges(column,
 			Update{Type: commit.Put, Index: 1, Value: value},
 			Update{Type: commit.Put, Index: 2, Value: value},
-			Update{Type: commit.Add, Index: 1, Value: value},
+			Update{Type: commit.Merge, Index: 1, Value: value},
 		)
 
 		assert.True(t, column.Contains(1))
@@ -212,7 +213,7 @@ func applyChanges(column Column, updates ...Update) {
 
 	r := new(commit.Reader)
 	r.Seek(buf)
-	column.Apply(r)
+	column.Apply(0, r)
 }
 
 type Update struct {
@@ -231,7 +232,10 @@ func TestForString(t *testing.T) {
 
 	data := []string{"a", "b", "c", "d"}
 	for i, d := range data {
-		coll.InsertObject(map[string]interface{}{"id": i, "data": d})
+		_, err := coll.Insert(func(r Row) error {
+			return r.SetMany(map[string]any{"id": i, "data": d})
+		})
+		assert.NoError(t, err)
 	}
 
 	coll.Query(func(txn *Txn) error {
@@ -251,27 +255,35 @@ func TestForKindInvalid(t *testing.T) {
 }
 
 func TestAtKey(t *testing.T) {
-	const serial = "c68a66f6-7b90-4b3a-8105-cfde490df780"
+	const testKey = "key=20"
 
 	// Update a name
 	players := loadPlayers(500)
-	players.QueryKey(serial, func(r Row) error {
-		r.SetEnum("name", "Roman")
+	players.CreateColumn("pk", ForKey())
+	assert.NoError(t, players.Query(func(txn *Txn) error {
+		pk := txn.Key()
+		return txn.Range(func(idx uint32) {
+			pk.Set(fmt.Sprintf("key=%d", idx))
+		})
+	}))
+
+	assert.NoError(t, players.QueryKey(testKey, func(r Row) error {
+		r.SetString("name", "Roman")
 		return nil
-	})
+	}))
 
 	// Read back and assert
 	assertion := func(r Row) error {
-		name, _ := r.Enum("name")
+		name, _ := r.String("name")
 		race, _ := r.Enum("race")
 		assert.Equal(t, "Roman", name)
 		assert.Equal(t, "elf", race)
 		return nil
 	}
 
-	assert.NoError(t, players.QueryKey(serial, assertion))
+	assert.NoError(t, players.QueryKey(testKey, assertion))
 	assert.NoError(t, players.Query(func(txn *Txn) error {
-		assert.NoError(t, txn.QueryKey(serial, assertion))
+		assert.NoError(t, txn.QueryKey(testKey, assertion))
 		return nil
 	}))
 }
@@ -286,7 +298,24 @@ func TestUpdateAtKeyWithoutPK(t *testing.T) {
 
 func TestSelectAtKeyWithoutPK(t *testing.T) {
 	col := NewCollection()
-	assert.Error(t, col.QueryKey("test", func(r Row) error {
+	assert.Error(t, col.QueryKey("test", func(r Row) error { return nil }))
+	assert.Error(t, col.InsertKey("test", func(r Row) error { return nil }))
+	assert.Error(t, col.UpsertKey("test", func(r Row) error { return nil }))
+	assert.Error(t, col.DeleteKey("test"))
+}
+
+func TestBulkUpdateDuplicatePK(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("key", ForKey())
+	assert.NoError(t, col.InsertKey("1", func(r Row) error { return nil }))
+	assert.NoError(t, col.InsertKey("2", func(r Row) error { return nil }))
+
+	// If we attempt to change to an already persisted key, we should get an error
+	assert.NoError(t, col.Query(func(txn *Txn) error {
+		pk := txn.Key()
+		assert.Error(t, txn.QueryKey("1", func(Row) error {
+			return pk.Set("2")
+		}))
 		return nil
 	}))
 }
@@ -308,7 +337,7 @@ func TestSnapshotBool(t *testing.T) {
 	rdr.Seek(buf)
 	output := ForBool()
 	output.Grow(8)
-	output.Apply(rdr)
+	output.Apply(0, rdr)
 	assert.Equal(t, input, output)
 }
 
@@ -333,22 +362,8 @@ func TestSnapshotIndex(t *testing.T) {
 	rdr.Seek(buf)
 	output := newIndex("test", "a", predicateFn)
 	output.Grow(8)
-	output.Apply(rdr)
+	output.Apply(0, rdr)
 	assert.Equal(t, input.Column.(*columnIndex).fill, output.Column.(*columnIndex).fill)
-}
-
-func TestResize(t *testing.T) {
-	assert.Equal(t, 1, resize(100, 0))
-	assert.Equal(t, 2, resize(100, 1))
-	assert.Equal(t, 4, resize(100, 2))
-	assert.Equal(t, 16, resize(100, 11))
-	assert.Equal(t, 256, resize(100, 255))
-	assert.Equal(t, 1232, resize(100, 1000))
-	assert.Equal(t, 1232, resize(200, 1000))
-	assert.Equal(t, 1232, resize(512, 1000))
-	assert.Equal(t, 1213, resize(500, 1000)) // Inconsistent
-	assert.Equal(t, 22504, resize(512, 20000))
-	assert.Equal(t, 28322, resize(22504, 22600))
 }
 
 func TestAccessors(t *testing.T) {
@@ -475,8 +490,7 @@ func TestPKAccessor(t *testing.T) {
 	assert.NoError(t, col.CreateColumn("name", ForKey()))
 
 	// Insert a primary key value
-	_, err := col.Insert(func(r Row) error {
-		r.txn.Key().Set("Roman")
+	err := col.InsertKey("Roman", func(r Row) error {
 		return nil
 	})
 	assert.NoError(t, err)
@@ -509,6 +523,261 @@ func TestIndexValue(t *testing.T) {
 	idx.Column.(*columnIndex).fill.Set(0)
 	_, ok := idx.Value(0)
 	assert.True(t, ok)
+}
+
+func TestDuplicatePK(t *testing.T) {
+	col := NewCollection()
+	assert.NoError(t, col.CreateColumn("name", ForKey()))
+
+	// Insert a primary key value
+	assert.NoError(t, col.InsertKey("Roman", func(r Row) error {
+		return nil
+	}))
+
+	// Insert a duplicate
+	assert.Error(t, col.InsertKey("Roman", func(r Row) error {
+		return nil
+	}))
+
+	// Must have one value
+	assert.Equal(t, 1, col.Count())
+}
+
+func TestMergeString(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("name", ForString())
+	col.CreateColumn("letters", ForString(WithMerge(func(value, delta string) string {
+		if len(value) > 0 {
+			value += ", "
+		}
+		return value + delta
+	})))
+
+	idx, _ := col.Insert(func(r Row) error {
+		r.SetString("name", "Roman")
+		r.SetString("letters", "a")
+		return nil
+	})
+
+	col.QueryAt(idx, func(r Row) error {
+		r.MergeString("name", "Merlin")
+		r.MergeString("letters", "b")
+		return nil
+	})
+
+	// Letters must be appended, name overwritten
+	col.QueryAt(idx, func(r Row) error {
+		name, _ := r.String("name")
+		assert.Equal(t, "Merlin", name)
+		letters, _ := r.String("letters")
+		assert.Equal(t, "a, b", letters)
+		return nil
+	})
+}
+
+func TestRecord(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("ts", ForRecord(func() *time.Time {
+		return new(time.Time)
+	}))
+	col.CreateIndex("recent", "ts", func(r Reader) bool {
+		var ts time.Time
+		if err := ts.UnmarshalBinary(r.Bytes()); err == nil {
+			return ts.After(time.Unix(1667745800, 0))
+		}
+		return false
+	})
+
+	// Insert the time, it implements binary marshaler
+	idx, _ := col.Insert(func(r Row) error {
+		now := time.Unix(1667745700, 0)
+		r.SetRecord("ts", &now)
+		return nil
+	})
+
+	// Index should not have any recent
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.Without("recent").Count())
+		return nil
+	})
+
+	// We should be able to read back the time
+	col.QueryAt(idx, func(r Row) error {
+		now := time.Unix(1667745900, 0)
+		r.MergeRecord("ts", &now)
+		return nil
+	})
+
+	// We should be able to read back the time
+	col.QueryAt(idx, func(r Row) error {
+		ts, ok := r.Record("ts")
+		assert.True(t, ok)
+		assert.Equal(t, "November", ts.(*time.Time).UTC().Month().String())
+		return nil
+	})
+
+	// Merge should have updated the index as well
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.With("recent").Count())
+		return nil
+	})
+}
+
+func TestRecord_Errors(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("id", ForInt64())
+	col.CreateColumn("ts", ForRecord(func() *time.Time {
+		return new(time.Time)
+	}))
+
+	// Column "xxx" does not exist
+	assert.Panics(t, func() {
+		col.Query(func(txn *Txn) error {
+			txn.Record("xxx")
+			return nil
+		})
+	})
+
+	// Column "id" is not of record type
+	assert.Panics(t, func() {
+		col.Query(func(txn *Txn) error {
+			txn.Record("id")
+			return nil
+		})
+	})
+
+	// No value at index 10
+	col.QueryAt(10, func(r Row) error {
+		v, ok := r.Record("ts")
+		assert.Nil(t, v)
+		assert.False(t, ok)
+		return nil
+	})
+
+}
+
+func TestRecordMerge_ErrDecode(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("record", ForRecord(func() mockRecord {
+		return mockRecord{
+			errDecode: true,
+		}
+	}))
+
+	// Insert the time, it implements binary marshaler
+	idx, _ := col.Insert(func(r Row) error {
+		r.SetRecord("record", mockRecord{})
+		return nil
+	})
+
+	// Merge a record, but will fail on decode
+	col.QueryAt(idx, func(r Row) error {
+		assert.NoError(t, r.MergeRecord("record", mockRecord{}))
+		return nil
+	})
+}
+
+func TestRecordMerge_ErrEncode(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("record", ForRecord(func() mockRecord {
+		return mockRecord{
+			errEncode: true,
+		}
+	}))
+
+	// Insert the time, it implements binary marshaler
+	idx, _ := col.Insert(func(r Row) error {
+		r.SetRecord("record", mockRecord{})
+		return nil
+	})
+
+	// Merge a record, but will fail on decode
+	col.QueryAt(idx, func(r Row) error {
+		assert.NoError(t, r.MergeRecord("record", mockRecord{}))
+		return nil
+	})
+}
+
+func TestNumberMerge(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("age", ForInt32(WithMerge(func(v, d int32) int32 {
+		v -= d
+		return v
+	})))
+
+	col.CreateIndex("young", "age", func(r Reader) bool {
+		return r.Int() < 50
+	})
+
+	// Insert the time, it implements binary marshaler
+	idx, _ := col.Insert(func(r Row) error {
+		r.SetInt32("age", 100)
+		return nil
+	})
+
+	for i := 0; i < 7; i++ {
+		col.QueryAt(idx, func(r Row) error {
+			r.MergeInt32("age", 10)
+			return nil
+		})
+	}
+
+	col.QueryAt(idx, func(r Row) error {
+		age, _ := r.Int32("age")
+		assert.Equal(t, int32(30), age)
+		return nil
+	})
+
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.With("young").Count())
+		return nil
+	})
+}
+
+func TestIssue87(t *testing.T) {
+	table := NewCollection()
+	table.CreateColumn("birthdate", ForRecord(func() *time.Time { return new(time.Time) }))
+
+	srcDate := time.Date(1999, 3, 2, 12, 0, 0, 0, time.Local)
+	table.Insert(func(r Row) error {
+		r.SetRecord("birthdate", srcDate)
+		return nil
+	})
+
+	table.Query(func(txn *Txn) error {
+		assert.Equal(t, txn.WithValue("birthdate", func(v any) bool {
+			return v.(*time.Time).Equal(srcDate)
+		}).Count(), 1)
+		return nil
+	})
+}
+
+// Tests the case where a column is created after inserting a large enough amount of data
+func TestIssue89(t *testing.T) {
+	coll := NewCollection()
+	coll.CreateColumn("foo", ForString())
+
+	// Should be larger than a single chunk
+	for i := 0; i < 16385; i++ {
+		coll.Insert(func(row Row) error {
+			row.SetString("foo", fmt.Sprintf("foo-%d", i))
+			return nil
+		})
+	}
+
+	// set up a derived column of data, over initial capacity
+	coll.CreateColumn("bar", ForString())
+	assert.NoError(t, coll.Query(func(txn *Txn) error {
+		src := txn.String("foo")
+		dest := txn.String("bar")
+		return txn.Range(func(_ uint32) {
+			value, ok := src.Get()
+			assert.True(t, ok)
+			dest.Set("bar-" + value[4:])
+		})
+	}))
+
+	assert.Equal(t, 16385, coll.Count())
 }
 
 func invoke(any interface{}, name string, args ...interface{}) []reflect.Value {

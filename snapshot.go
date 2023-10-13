@@ -163,9 +163,9 @@ func (c *Collection) writeState(dst io.Writer) (int64, error) {
 
 // readState reads a collection snapshotted state from the underlying reader. It
 // returns the last commit IDs for each chunk.
-func (c *Collection) readState(src io.Reader) ([]uint64, error) {
+func (c *Collection) readState(src io.Reader) (map[commit.Chunk]uint64, error) {
 	r := iostream.NewReader(src)
-	commits := make([]uint64, 128)
+	commits := make(map[commit.Chunk]uint64)
 
 	// Read the version and make sure it matches
 	version, err := r.ReadUvarint()
@@ -185,7 +185,7 @@ func (c *Collection) readState(src io.Reader) ([]uint64, error) {
 			txn.dirty.Set(uint32(chunk))
 
 			// Read the last written commit ID for the chunk
-			if commits[chunk], err = r.ReadUvarint(); err != nil {
+			if commits[commit.Chunk(chunk)], err = r.ReadUvarint(); err != nil {
 				return err
 			}
 
@@ -217,4 +217,16 @@ func (c *Collection) chunks() int {
 
 	max, _ := c.fill.Max()
 	return int(commit.ChunkAt(max) + 1)
+}
+
+// readChunk acquires appropriate locks for a chunk and executes a read callback.
+// This is used for snapshotting purposes only.
+func (c *Collection) readChunk(chunk commit.Chunk, fn func(uint64, commit.Chunk, bitmap.Bitmap) error) error {
+
+	// Lock both the chunk and the fill list
+	c.slock.RLock(uint(chunk))
+	c.lock.Lock()
+	defer c.slock.RUnlock(uint(chunk))
+	defer c.lock.Unlock()
+	return fn(c.commits[chunk], chunk, chunk.OfBitmap(c.fill))
 }
